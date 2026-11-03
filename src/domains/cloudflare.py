@@ -64,6 +64,21 @@ class CloudflareClient:
         servers = [str(item) for item in (zone.get("name_servers") or []) if item]
         return ZoneInfo(id=str(zone["id"]), name_servers=servers, created=True)
 
+    def list_account_zones(self) -> list[dict[str, Any]]:
+        """Зоны аккаунта. Пустой список — аккаунт ещё без зон."""
+        query = urllib.parse.urlencode({"account.id": self.account_id, "per_page": "50"})
+        data = self._request("GET", f"/zones?{query}")
+        result = data.get("result") if isinstance(data, dict) else None
+        if not isinstance(result, list):
+            return []
+        zones: list[dict[str, Any]] = []
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            servers = [str(ns) for ns in (item.get("name_servers") or []) if ns]
+            zones.append({"name": str(item.get("name") or "").strip().lower(), "name_servers": servers})
+        return zones
+
     def find_zone(self, name: str) -> ZoneInfo | None:
         query = urllib.parse.urlencode({"name": name})
         data = self._request("GET", f"/zones?{query}")
