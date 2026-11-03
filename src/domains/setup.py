@@ -224,7 +224,10 @@ def setup_purchased_domain(
         if "crm_domain" not in done:
             if not crm.domain_exists(name):
                 expires = state.get("expiration") or expiration_in_one_year(today)
-                payload = domain_create_payload(name, account, expires)
+                ns = list(state.get("ns") or [])
+                if len(ns) < 2:
+                    raise DomainSetupError("У зоны нет двух NS")
+                payload = domain_create_payload(name, account, expires, ns[0], ns[1])
                 crm.create_portal_domain(payload)
                 mark("crm_domain", f"{name}: домен добавлен в CRM")
             else:

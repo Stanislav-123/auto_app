@@ -20,7 +20,14 @@ def cloudflare_account_update_payload(account: dict[str, Any], ns0: str, ns1: st
     }
 
 
-def domain_create_payload(domain: str, account: dict[str, Any], expiration_date: str) -> dict[str, Any]:
+def domain_create_payload(
+    domain: str,
+    account: dict[str, Any],
+    expiration_date: str,
+    ns0: str,
+    ns1: str,
+) -> dict[str, Any]:
+    """Привязать уже существующий аккаунт CF. cloudflare_account_id создаёт дубль в CRM."""
     return {
         "batch": domain,
         "status": 1,
@@ -31,10 +38,10 @@ def domain_create_payload(domain: str, account: dict[str, Any], expiration_date:
         "cloudflare_accounts": [
             {
                 "domain": domain,
-                "primary_ns": None,
-                "secondary_ns": None,
-                "auth_key": None,
-                "cloudflare_account_id": str(account.get("id")),
+                "primary_ns": ns0,
+                "secondary_ns": ns1,
+                "auth_key": account.get("auth_key"),
+                "cf_db_account_id": str(account.get("id")),
                 "email": account.get("email"),
                 "password": account.get("password"),
             }
