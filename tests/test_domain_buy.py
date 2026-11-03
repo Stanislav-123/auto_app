@@ -3,11 +3,11 @@ import unittest
 from datetime import date
 from unittest.mock import patch
 
-from src.domains.cloudflare import cloudflare_auth_headers
-from src.domains.dynadot import DynadotError, parse_search_response, ensure_command_ok
+from src.domains.cloudflare import CloudflareError, cloudflare_auth_headers
+from src.domains.dynadot import DynadotError, expiration_to_date, parse_domain_info, parse_search_response, ensure_command_ok
 from src.domains.names import generate_candidate
 from src.domains.payloads import cloudflare_account_update_payload, domain_create_payload
-from src.domains.pricing import expiration_in_one_year, is_affordable, parse_usd_price
+from src.domains.pricing import expiration_in_one_year, is_affordable, parse_domain_list, parse_usd_price
 from src.domains.setup import (
     collect_affordable,
     quotes_over_limit,
@@ -275,6 +275,149 @@ class TestCloudflareAuth(unittest.TestCase):
     def test_user_token_is_bearer(self):
         headers = cloudflare_auth_headers("a@b.c", "cfut_example")
         self.assertEqual(headers["Authorization"], "Bearer cfut_example")
+
+
+class TestDomainList(unittest.TestCase):
+    def test_pasted_table_and_urls(self):
+        text = """
+        https://www.Backend42.top/path
+        dev7.sbs, https://API9.sbs/
+        backend42.top
+        not-a-domain
+        www.dev7.sbs/foo
+        """
+        self.assertEqual(parse_domain_list(text), ["backend42.top", "dev7.sbs", "api9.sbs"])
+
+
+class TestSetupOnly(unittest.TestCase):
+    def setUp(self):
+        reset_reservations()
+
+    def test_skips_purchase_and_uses_real_expiration(self):
+        class OwnedDyn(FakeDyn):
+            def domain_record(self, name):
+                if name == "missing.top":
+                    return False, None
+                if name == "old.sbs":
+                    return True, "2028-04-01"
+                return True, None
+
+        dyn = OwnedDyn()
+        crm = FakeCRM([_account(1), _account(2, "cf-2")])
+
+        def factory(account):
+            return FakeCF()
+
+        states = [
+            {"name": "old.sbs", "skip_buy": True, "done": [], "expiration": None},
+            {"name": "missing.top", "skip_buy": True, "done": []},
+            {"name": "fresh.top", "skip_buy": True, "done": []},
+        ]
+        messages = run_confirmed_batch(
+            states,
+            dynadot=dyn,
+            crm=crm,
+            ip="5.75.214.90",
+            confirmed=True,
+            today=date(2026, 11, 3),
+            cf_factory=factory,
+        )
+        self.assertEqual(dyn.registered, [])
+        self.assertTrue(any("missing.top" in line and "Dynadot" in line for line in messages))
+        by_name = {item["batch"]: item for item in crm.created}
+        self.assertEqual(set(by_name), {"old.sbs", "fresh.top"})
+        self.assertEqual(by_name["old.sbs"]["expiration_date"], "2028-04-01")
+        self.assertEqual(by_name["fresh.top"]["expiration_date"], "2027-11-03")
+        self.assertEqual(by_name["old.sbs"]["registrator"], "dynadot")
+        self.assertEqual(by_name["old.sbs"]["status"], 1)
+        self.assertEqual(by_name["old.sbs"]["type_source"], 3)
+
+    def test_domain_info_expiration(self):
+        owned, expires = parse_domain_info(
+            {
+                "DomainInfoResponse": {
+                    "ResponseCode": 0,
+                    "Status": "success",
+                    "DomainInfo": {"Name": "old.sbs", "Expiration": "1361430589062"},
+                }
+            }
+        )
+        self.assertTrue(owned)
+        self.assertEqual(expires, "2013-02-21")
+        self.assertEqual(expiration_to_date("1361430589062"), "2013-02-21")
+        missing, _ = parse_domain_info(
+            {"DomainInfoResponse": {"ResponseCode": -1, "Status": "error", "Error": "not found"}}
+        )
+        self.assertFalse(missing)
+
+
+class TestOccupiedCloudflare(unittest.TestCase):
+    def setUp(self):
+        reset_reservations()
+
+    def test_marks_account_with_foreign_zone_and_uses_next(self):
+        class ZoningCF(FakeCF):
+            def __init__(self, zones):
+                super().__init__()
+                self._zones = zones
+
+            def list_account_zones(self):
+                return self._zones
+
+        dyn = FakeDyn()
+        crm = FakeCRM([_account(1), _account(2, "cf-2")])
+
+        def factory(account):
+            if account["id"] == 1:
+                return ZoningCF([{"name": "taken.com", "name_servers": ["a.ns.cloudflare.com", "b.ns.cloudflare.com"]}])
+            return ZoningCF([])
+
+        states = [{"name": "ok.sbs", "price": 2, "done": []}]
+        messages = run_confirmed_batch(
+            states,
+            dynadot=dyn,
+            crm=crm,
+            ip="5.75.214.90",
+            confirmed=True,
+            today=date(2026, 11, 3),
+            cf_factory=factory,
+        )
+        self.assertEqual(dyn.registered, ["ok.sbs"])
+        self.assertEqual(crm.busy[0][0], 1)
+        self.assertEqual(crm.busy[0][1]["status"], 1)
+        self.assertEqual(crm.busy[0][1]["first_ns"], "a.ns.cloudflare.com")
+        self.assertEqual(crm.created[0]["cloudflare_accounts"][0]["cloudflare_account_id"], "2")
+        self.assertTrue(any("уже с зоной" in line for line in messages))
+
+    def test_auth_failure_is_not_marked_busy(self):
+        class BadCF(FakeCF):
+            def list_account_zones(self):
+                raise CloudflareError("HTTP 403: authentication error")
+
+        class EmptyCF(FakeCF):
+            def list_account_zones(self):
+                return []
+
+        dyn = FakeDyn()
+        crm = FakeCRM([_account(1), _account(2, "cf-2")])
+
+        def factory(account):
+            if account["id"] == 1:
+                return BadCF()
+            return EmptyCF()
+
+        states = [{"name": "ok.sbs", "price": 2, "done": []}]
+        run_confirmed_batch(
+            states,
+            dynadot=dyn,
+            crm=crm,
+            ip="5.75.214.90",
+            confirmed=True,
+            today=date(2026, 11, 3),
+            cf_factory=factory,
+        )
+        self.assertEqual([item[0] for item in crm.busy], [2])
+        self.assertEqual(crm.created[0]["cloudflare_accounts"][0]["cloudflare_account_id"], "2")
 
 
 class TestMasking(unittest.TestCase):
