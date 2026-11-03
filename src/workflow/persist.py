@@ -43,6 +43,7 @@ _PERSIST_KEYS = {
     "crm_needs_recollect",
     "failed_step",
     "failed_error",
+    "domain_job",
 }
 
 
