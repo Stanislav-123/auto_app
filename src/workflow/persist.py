@@ -24,6 +24,7 @@ _PERSIST_KEYS = {
     "backend",
     "awaiting_missing",
     "awaiting_after",
+    "awaiting_app",
     "awaiting_domain",
     "awaiting_android_fb",
     "android_fb",

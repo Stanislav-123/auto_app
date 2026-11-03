@@ -47,6 +47,7 @@ from src.crm.zip_assets import safe_upload_filename, safe_zip_filename
 from src.formatter import format_missing_prompt, format_parsed_app, is_parse_complete
 from src.models import ParsedApp, Platform, parsed_from_dict
 from src.parser import merge_missing_reply, parse_app_message
+from src.workflow.intake import extract_app_command_payload, workflow_reply_kind
 from src.workflow.locks import user_lock
 from src.workflow.logging_setup import setup_logging
 from src.workflow.runner import (
@@ -90,10 +91,18 @@ _workflow_store = WorkflowStore()
 
 START_TEXT = (
     "👋 <b>Бот завода приложений</b>\n\n"
-    "Перешлите или отправьте сообщение о новом приложении.\n\n"
-    "Дальше шаги идут сами: бот пишет, что сейчас делается и что уже готово.\n"
-    "Архив, тематику, домен и ключи Facebook попросит, только если без них никак.\n\n"
-    "Поддерживаются форматы iOS 🍏 и Android 🤖"
+    "Завод начинается только командой <code>/app</code>.\n\n"
+    "Можно сразу:\n"
+    "<code>/app\nНовое IOS приложение\n...</code>\n\n"
+    "Или <code>/app</code> без текста — бот подождёт следующее сообщение с данными.\n\n"
+    "Дальше шаги идут сами. Архив, тематику, домен и ключи Facebook "
+    "бот попросит отдельно, их можно присылать обычным сообщением.\n\n"
+    "Просто пересланный текст без <code>/app</code> завод не запускает."
+)
+
+APP_WAIT_TEXT = (
+    "Пришлите сообщение о приложении следующим сообщением.\n"
+    "Можно переслать его как есть."
 )
 
 
@@ -528,6 +537,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(START_TEXT, parse_mode=ParseMode.HTML)
 
 
+async def app_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Старт завода: /app с текстом сразу или /app и данные следующим сообщением."""
+
+    async def _body() -> None:
+        message = update.message
+        if not message:
+            return
+
+        payload = extract_app_command_payload(message.text or message.caption or "")
+        _log_user_action(update, "app_command", has_payload=bool(payload))
+        if not payload:
+            wf = _workflow(context)
+            wf.clear()
+            wf["awaiting_app"] = True
+            await message.reply_text(APP_WAIT_TEXT, parse_mode=ParseMode.HTML)
+            return
+
+        await _ingest_app_text(update, context, payload)
+
+    await _run_locked(update, _body)
+
+
 async def step2_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """DEV: parse app message and jump straight to CRM (skip Binom)."""
     message = update.message
@@ -761,31 +792,60 @@ async def _handle_message_body(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     wf = _workflow(context)
-    if wf.get("crm_collecting"):
+    kind = workflow_reply_kind(wf)
+
+    if kind == "crm":
         await _handle_crm_file_message(update, context, wf)
         return
 
     text = message.text or message.caption
-    if wf.get("awaiting_android_fb"):
+    if kind == "android_fb":
         if not text:
             await message.reply_text("Пришлите настройки Facebook текстом.")
             return
         await _handle_android_fb_reply(update, context, wf, text)
         return
 
-    if not text:
-        await message.reply_text("Отправьте текстовое сообщение с данными о приложении.")
-        return
-
-    if wf.get("awaiting_domain"):
+    if kind == "domain":
+        if not text:
+            await message.reply_text("Пришлите домен текстом.")
+            return
         await _handle_domain_reply(update, context, wf, text)
         return
 
-    if wf.get("awaiting_missing") and wf.get("parsed"):
+    if kind == "missing":
+        if not text:
+            await message.reply_text("Пришлите недостающие данные текстом.")
+            return
         await _handle_missing_reply(update, context, wf, text)
         return
 
+    if kind == "app":
+        if not text:
+            await message.reply_text(APP_WAIT_TEXT, parse_mode=ParseMode.HTML)
+            return
+        wf.pop("awaiting_app", None)
+        await _ingest_app_text(update, context, text)
+        return
+
+    await message.reply_text(
+        "Завод начинается с команды <code>/app</code>.\n"
+        "Пересланное сообщение само по себе ничего не запускает.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _ingest_app_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
     parsed = parse_app_message(text)
+    wf = _workflow(context)
     app_key = app_key_from_parsed(parsed)
     if app_key:
         resumable = _find_resumable_state(update, context, app_key)
@@ -1409,6 +1469,7 @@ def main() -> None:
     app = Application.builder().token(token).build()
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", start, filters=user_filter))
+    app.add_handler(CommandHandler("app", app_command, filters=user_filter))
     app.add_handler(CommandHandler("step2", step2_dev, filters=user_filter))
     app.add_handler(CommandHandler("back_android", back_android_dev, filters=user_filter))
     app.add_handler(AllowedCallbackQueryHandler(handle_step_callback, user_filter, pattern=r"^wf:"))
