@@ -1,7 +1,9 @@
+import json
 import unittest
 from unittest.mock import MagicMock, patch
+from urllib.error import URLError
 
-from src.binom.client import BinomClient, BinomError
+from src.binom.client import BinomClient, BinomError, _panel_campaigns_url
 from src.binom.names import format_campaign_name
 from src.binom.templates import get_template_campaign_id
 from src.models import Platform
@@ -77,6 +79,58 @@ class TestBinomClient(unittest.TestCase):
         with patch.object(client, "_call", side_effect=BinomError("test error")):
             with self.assertRaises(BinomError):
                 client.clone_campaign("name")
+
+    def test_panel_url_from_arm(self):
+        self.assertEqual(
+            _panel_campaigns_url("https://tracker.test/arm.php"),
+            "https://tracker.test/panel.php",
+        )
+
+    def test_find_campaign_by_exact_name(self):
+        client = BinomClient("https://tracker.test/arm.php", "test-key")
+        payload = json.dumps(
+            [
+                {"id": "3", "name": "other", "status": "1", "keyword": "nope", "url": "https://t/?key=nope"},
+                {
+                    "id": "8",
+                    "name": "[ZM Apps] Searock - id1 - 888 iOS [IO]",
+                    "status": "1",
+                    "keyword": "abc",
+                    "link": "https://tracker.test/c?key=abc",
+                },
+                {
+                    "id": "2",
+                    "name": "[ZM Apps] Searock - id1 - 888 iOS [IO]",
+                    "status": "0",
+                    "keyword": "old",
+                    "url": "https://tracker.test/c?key=old",
+                },
+            ]
+        ).encode()
+
+        class Resp:
+            status = 200
+
+            def read(self):
+                return payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with patch("src.binom.client.urllib.request.urlopen", return_value=Resp()):
+            found = client.find_campaign_by_name("[ZM Apps] Searock - id1 - 888 iOS [IO]")
+        self.assertIsNotNone(found)
+        self.assertEqual(found.id, 8)
+        self.assertEqual(found.key, "abc")
+
+    def test_urlerror_becomes_binom_error(self):
+        client = BinomClient("https://tracker.test/arm.php", "test-key")
+        with patch("src.binom.client.urllib.request.urlopen", side_effect=URLError("refused")):
+            with self.assertRaises(BinomError):
+                client.list_campaigns("name")
 
 
 if __name__ == "__main__":

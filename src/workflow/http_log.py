@@ -17,6 +17,9 @@ _SENSITIVE_KEYS = {
     "fb_access_token",
     "fb_decryption_key",
     "settings_appsflyer_key_api_v2",
+    "appsflyer_dev_key",
+    "appsflyer_key",
+    "facebook_decryption_key",
 }
 
 _BINARYISH_KEYS = {
