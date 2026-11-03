@@ -3,11 +3,16 @@ from __future__ import annotations
 from typing import Any
 
 
+def cloudflare_account_status_payload() -> dict[str, Any]:
+    """Занять аккаунт: только статус. Почту не шлём — из-за неё CRM отвечает 409."""
+    return {"status": 1}
+
+
 def cloudflare_account_update_payload(account: dict[str, Any], ns0: str, ns1: str) -> dict[str, Any]:
+    """Запасной update, если CRM требует остальные поля. Почты здесь тоже нет."""
     return {
         "account_id": account.get("account_id"),
         "auth_key": account.get("auth_key"),
-        "email": account.get("email"),
         "first_ns": ns0,
         "second_ns": ns1,
         "password": account.get("password"),

@@ -87,6 +87,15 @@ class CloudflareClient:
             raise CloudflareError(_cf_error(created))
         return True
 
+    def delete_zone(self, zone_id: str) -> None:
+        """Удаляет зону этого запуска. 404 — её уже нет."""
+        try:
+            self._request("DELETE", f"/zones/{zone_id}")
+        except CloudflareError as exc:
+            if "404" in str(exc):
+                return
+            raise
+
     def ensure_ssl_flexible(self, zone_id: str) -> bool:
         """True если настройка изменена, False если уже flexible."""
         current = self._request("GET", f"/zones/{zone_id}/settings/ssl")
