@@ -5,7 +5,7 @@ import threading
 from datetime import date
 from typing import Any, Callable
 
-from src.domains.cloudflare import CloudflareClient, CloudflareError, _looks_like_auth_error
+from src.domains.cloudflare import CloudflareClient
 from src.domains.dynadot import DynadotClient, DynadotError
 from src.domains.names import generate_candidate
 from src.domains.payloads import (
@@ -338,7 +338,7 @@ def run_confirmed_batch(
                 if on_progress:
                     on_progress()
 
-            account = _account_for_state(state, free, crm=crm, target_domain=name, cf_factory=cf_factory, say=say)
+            account = _account_for_state(state, free)
             if account is None:
                 state["failed_step"] = "zone"
                 state["error"] = "нет свободного аккаунта Cloudflare"
@@ -415,68 +415,14 @@ def _ownership(dynadot: Any, name: str) -> tuple[bool, str | None]:
         return True, None
 
 
-def _account_for_state(
-    state: dict[str, Any],
-    free: list[dict[str, Any]],
-    *,
-    crm: Any | None = None,
-    target_domain: str = "",
-    cf_factory: Callable[[dict[str, Any]], Any] | None = None,
-    say: Callable[[str], None] | None = None,
-) -> dict[str, Any] | None:
+def _account_for_state(state: dict[str, Any], free: list[dict[str, Any]]) -> dict[str, Any] | None:
     stored = state.get("cf_account")
     if isinstance(stored, dict) and stored.get("id") is not None:
         return stored
-    while True:
-        account = take_free_account(free)
-        if account is None:
-            return None
-        if crm is None or not _account_is_usable(account, target_domain, crm, cf_factory, say):
-            if crm is None:
-                remember_account(state, account)
-                return account
-            continue
+    account = take_free_account(free)
+    if account is not None:
         remember_account(state, account)
-        return account
-
-
-def _account_is_usable(
-    account: dict[str, Any],
-    target_domain: str,
-    crm: Any,
-    cf_factory: Callable[[dict[str, Any]], Any] | None,
-    say: Callable[[str], None] | None,
-) -> bool:
-    """False — аккаунт не брать. Занятый помечаем в CRM, с битым ключом только пропускаем."""
-    factory = cf_factory or build_cf_client
-    client = factory(account)
-    if not hasattr(client, "list_account_zones"):
-        return True
-    try:
-        zones = client.list_account_zones()
-    except CloudflareError as exc:
-        if _looks_like_auth_error(str(exc)):
-            log_step("cf_account_auth_failed", crm_id=account.get("id"))
-            if say:
-                say(f"Аккаунт CF #{account.get('id')} не пускает по ключу, беру следующий")
-            return False
-        log_step("cf_account_zones_failed", crm_id=account.get("id"), error=str(exc))
-        if say:
-            say(f"Аккаунт CF #{account.get('id')}: не прочитал зоны ({exc}), беру следующий")
-        return False
-    others = [zone for zone in zones if str(zone.get("name") or "") != target_domain]
-    if not others:
-        return True
-    ns = list(others[0].get("name_servers") or [])
-    ns0 = ns[0] if ns else str(account.get("first_ns") or "")
-    ns1 = ns[1] if len(ns) > 1 else str(account.get("second_ns") or "")
-    payload = cloudflare_account_update_payload(account, ns0, ns1)
-    crm.mark_cloudflare_account_busy(int(account["id"]), payload)
-    account["status"] = 1
-    log_step("cf_account_occupied", crm_id=account.get("id"), zones=len(zones))
-    if say:
-        say(f"Аккаунт CF #{account.get('id')} уже с зоной, пометил занятым в CRM")
-    return False
+    return account
 
 
 def reset_reservations() -> None:

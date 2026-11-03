@@ -3,7 +3,7 @@ import unittest
 from datetime import date
 from unittest.mock import patch
 
-from src.domains.cloudflare import CloudflareError, cloudflare_auth_headers
+from src.domains.cloudflare import cloudflare_auth_headers
 from src.domains.dynadot import DynadotError, expiration_to_date, parse_domain_info, parse_search_response, ensure_command_ok
 from src.domains.names import generate_candidate
 from src.domains.payloads import cloudflare_account_update_payload, domain_create_payload
@@ -349,75 +349,6 @@ class TestSetupOnly(unittest.TestCase):
             {"DomainInfoResponse": {"ResponseCode": -1, "Status": "error", "Error": "not found"}}
         )
         self.assertFalse(missing)
-
-
-class TestOccupiedCloudflare(unittest.TestCase):
-    def setUp(self):
-        reset_reservations()
-
-    def test_marks_account_with_foreign_zone_and_uses_next(self):
-        class ZoningCF(FakeCF):
-            def __init__(self, zones):
-                super().__init__()
-                self._zones = zones
-
-            def list_account_zones(self):
-                return self._zones
-
-        dyn = FakeDyn()
-        crm = FakeCRM([_account(1), _account(2, "cf-2")])
-
-        def factory(account):
-            if account["id"] == 1:
-                return ZoningCF([{"name": "taken.com", "name_servers": ["a.ns.cloudflare.com", "b.ns.cloudflare.com"]}])
-            return ZoningCF([])
-
-        states = [{"name": "ok.sbs", "price": 2, "done": []}]
-        messages = run_confirmed_batch(
-            states,
-            dynadot=dyn,
-            crm=crm,
-            ip="5.75.214.90",
-            confirmed=True,
-            today=date(2026, 11, 3),
-            cf_factory=factory,
-        )
-        self.assertEqual(dyn.registered, ["ok.sbs"])
-        self.assertEqual(crm.busy[0][0], 1)
-        self.assertEqual(crm.busy[0][1]["status"], 1)
-        self.assertEqual(crm.busy[0][1]["first_ns"], "a.ns.cloudflare.com")
-        self.assertEqual(crm.created[0]["cloudflare_accounts"][0]["cloudflare_account_id"], "2")
-        self.assertTrue(any("уже с зоной" in line for line in messages))
-
-    def test_auth_failure_is_not_marked_busy(self):
-        class BadCF(FakeCF):
-            def list_account_zones(self):
-                raise CloudflareError("HTTP 403: authentication error")
-
-        class EmptyCF(FakeCF):
-            def list_account_zones(self):
-                return []
-
-        dyn = FakeDyn()
-        crm = FakeCRM([_account(1), _account(2, "cf-2")])
-
-        def factory(account):
-            if account["id"] == 1:
-                return BadCF()
-            return EmptyCF()
-
-        states = [{"name": "ok.sbs", "price": 2, "done": []}]
-        run_confirmed_batch(
-            states,
-            dynadot=dyn,
-            crm=crm,
-            ip="5.75.214.90",
-            confirmed=True,
-            today=date(2026, 11, 3),
-            cf_factory=factory,
-        )
-        self.assertEqual([item[0] for item in crm.busy], [2])
-        self.assertEqual(crm.created[0]["cloudflare_accounts"][0]["cloudflare_account_id"], "2")
 
 
 class TestMasking(unittest.TestCase):
