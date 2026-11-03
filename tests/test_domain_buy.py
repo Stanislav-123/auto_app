@@ -187,8 +187,14 @@ class TestPurchaseGuard(unittest.TestCase):
         self.assertNotIn("bad.top", dyn.registered)
         self.assertTrue(any("bad.top" in line and "покупка" in line for line in messages))
         self.assertEqual(len(crm.created), 2)
-        used_ids = [payload["cloudflare_accounts"][0]["cloudflare_account_id"] for payload in crm.created]
+        used_ids = [payload["cloudflare_accounts"][0]["cf_db_account_id"] for payload in crm.created]
         self.assertEqual(len(set(used_ids)), 2)
+        for payload in crm.created:
+            item = payload["cloudflare_accounts"][0]
+            self.assertNotIn("cloudflare_account_id", item)
+            self.assertEqual(item["primary_ns"], "ada.ns.cloudflare.com")
+            self.assertEqual(item["secondary_ns"], "bob.ns.cloudflare.com")
+            self.assertEqual(item["auth_key"], f"cfk_{item['cf_db_account_id']}")
         self.assertEqual([payload for _, payload in crm.busy], [{"status": 1}, {"status": 1}])
 
     def test_specific_over_limit_is_not_silent(self):
@@ -229,7 +235,13 @@ class TestCrmPayloads(unittest.TestCase):
             },
         )
         self.assertNotIn("email", update)
-        created = domain_create_payload("backend42.top", account, expiration_in_one_year(date(2026, 11, 3)))
+        created = domain_create_payload(
+            "backend42.top",
+            account,
+            expiration_in_one_year(date(2026, 11, 3)),
+            ns0,
+            ns1,
+        )
         self.assertEqual(
             created,
             {
@@ -242,16 +254,17 @@ class TestCrmPayloads(unittest.TestCase):
                 "cloudflare_accounts": [
                     {
                         "domain": "backend42.top",
-                        "primary_ns": None,
-                        "secondary_ns": None,
-                        "auth_key": None,
-                        "cloudflare_account_id": "15",
+                        "primary_ns": ns0,
+                        "secondary_ns": ns1,
+                        "auth_key": "cfk_15",
+                        "cf_db_account_id": "15",
                         "email": "u15@cf.test",
                         "password": "secret-15",
                     }
                 ],
             },
         )
+        self.assertNotIn("cloudflare_account_id", created["cloudflare_accounts"][0])
 
 
 class TestDynadotShapes(unittest.TestCase):
