@@ -3,12 +3,13 @@ from __future__ import annotations
 import random
 import threading
 from datetime import date
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 
 from src.domains.cloudflare import CloudflareClient
 from src.domains.dynadot import DynadotClient, DynadotError
 from src.domains.names import generate_candidate
 from src.domains.payloads import (
+    cloudflare_account_status_payload,
     cloudflare_account_update_payload,
     domain_create_payload,
     nameservers_differ,
@@ -21,10 +22,19 @@ _RESERVED_IDS: set[str] = set()
 
 MAX_SEARCH_ATTEMPTS = 200
 MAX_BULK = 20
+MAX_CF_BUSY_ATTEMPTS = 5
 
 
 class DomainSetupError(Exception):
     """Ошибка шага покупки или настройки домена."""
+
+
+class AccountUnusable(Exception):
+    """CRM не дала пометить аккаунт занятым. Зона этого запуска уже снята."""
+
+    def __init__(self, reason: str, notice: str) -> None:
+        super().__init__(reason)
+        self.notice = notice
 
 
 def collect_affordable(
@@ -90,14 +100,18 @@ def register_available(
     return bought, failed
 
 
-def take_free_account(accounts: list[dict[str, Any]]) -> dict[str, Any] | None:
+def take_free_account(
+    accounts: list[dict[str, Any]],
+    excluded: set[str] | None = None,
+) -> dict[str, Any] | None:
+    banned = excluded or set()
     with _ACCOUNT_LOCK:
         for account in accounts:
             ident = str(account.get("id"))
             status = account.get("status")
             if status not in (0, "0", None):
                 continue
-            if ident in _RESERVED_IDS:
+            if ident in _RESERVED_IDS or ident in banned:
                 continue
             _RESERVED_IDS.add(ident)
             return account
@@ -133,6 +147,8 @@ def setup_purchased_domain(
     ip: str,
     today: date | None = None,
     emit: Callable[[str], None] | None = None,
+    on_progress: Callable[[], None] | None = None,
+    excluded: list[str] | None = None,
 ) -> list[str]:
     """Доводит один уже купленный домен. Возвращает новые сообщения о шагах."""
     notes: list[str] = []
@@ -171,11 +187,24 @@ def setup_purchased_domain(
                     crm_ns=f"{account.get('first_ns')},{account.get('second_ns')}",
                     zone_ns=",".join(zone.name_servers),
                 )
+            state["zone_created"] = bool(zone.created)
             remember_account(state, account)
             mark("zone", f"{name}: зона {'создана' if zone.created else 'уже была'}")
+            if on_progress:
+                on_progress()
 
         if "cf_busy" not in done and "zone" in done:
-            _mark_account_busy(state, account, crm, notes, name)
+            _mark_account_busy(
+                state,
+                account,
+                cf,
+                crm,
+                notes,
+                name,
+                emit=emit,
+                on_progress=on_progress,
+                excluded=excluded,
+            )
 
         if "a" not in done:
             created = cf.ensure_apex_a(state["zone_id"], name, ip)
@@ -200,6 +229,8 @@ def setup_purchased_domain(
                 mark("crm_domain", f"{name}: домен добавлен в CRM")
             else:
                 mark("crm_domain", f"{name}: домен уже был в CRM")
+    except AccountUnusable:
+        raise
     except Exception as exc:
         step = _failed_step(done)
         state["failed_step"] = step
@@ -216,9 +247,14 @@ def setup_purchased_domain(
 def _mark_account_busy(
     state: dict[str, Any],
     account: dict[str, Any],
+    cf: Any,
     crm: Any,
     notes: list[str],
     name: str,
+    *,
+    emit: Callable[[str], None] | None = None,
+    on_progress: Callable[[], None] | None = None,
+    excluded: list[str] | None = None,
 ) -> None:
     done = state.setdefault("done", [])
     if "cf_busy" in done:
@@ -227,14 +263,127 @@ def _mark_account_busy(
         done.append("cf_busy")
         notes.append(f"{name}: аккаунт CF уже занят")
         return
-    ns = list(state.get("ns") or [])
-    if len(ns) < 2:
-        raise DomainSetupError("Нечего записать в NS аккаунта CF")
-    payload = cloudflare_account_update_payload(account, ns[0], ns[1])
-    crm.mark_cloudflare_account_busy(int(account["id"]), payload)
+    crm_id = int(account["id"])
+    try:
+        crm.mark_cloudflare_account_busy(crm_id, cloudflare_account_status_payload())
+    except Exception as exc:
+        if not _is_missing_fields_error(exc):
+            _give_up_account(
+                state,
+                account,
+                cf,
+                name,
+                exc,
+                emit=emit,
+                on_progress=on_progress,
+                excluded=excluded,
+            )
+        ns = list(state.get("ns") or [])
+        if len(ns) < 2:
+            _give_up_account(
+                state,
+                account,
+                cf,
+                name,
+                exc,
+                emit=emit,
+                on_progress=on_progress,
+                excluded=excluded,
+            )
+        payload = cloudflare_account_update_payload(account, ns[0], ns[1])
+        try:
+            crm.mark_cloudflare_account_busy(crm_id, payload)
+        except Exception as fallback_exc:
+            _give_up_account(
+                state,
+                account,
+                cf,
+                name,
+                fallback_exc,
+                emit=emit,
+                on_progress=on_progress,
+                excluded=excluded,
+            )
     account["status"] = 1
+    stored = state.get("cf_account")
+    if isinstance(stored, dict):
+        stored["status"] = 1
     done.append("cf_busy")
     notes.append(f"{name}: аккаунт CF отмечен занятым")
+
+
+def _is_missing_fields_error(exc: BaseException) -> bool:
+    """CRM отвергла короткий payload, потому что ждёт остальные поля."""
+    text = str(exc).lower()
+    if "уже занят" in text or "already been taken" in text:
+        return False
+    if "http 422" in text:
+        return True
+    needles = (
+        "необходимо заполнить",
+        "не должно быть пустым",
+        "не может быть пустым",
+        "cannot be blank",
+        "can't be blank",
+        "is required",
+        "field is required",
+        "обязательн",
+    )
+    return any(needle in text for needle in needles)
+
+
+def _give_up_account(
+    state: dict[str, Any],
+    account: dict[str, Any],
+    cf: Any,
+    name: str,
+    exc: BaseException,
+    *,
+    emit: Callable[[str], None] | None,
+    on_progress: Callable[[], None] | None,
+    excluded: list[str] | None,
+) -> NoReturn:
+    reason = str(exc)
+    email = account.get("email") or account.get("id")
+    deleted = False
+    zone_id = state.get("zone_id")
+    if state.get("zone_created") and zone_id:
+        try:
+            cf.delete_zone(str(zone_id))
+            deleted = True
+        except Exception as delete_exc:
+            log_step(
+                "cf_zone_delete_failed",
+                domain=name,
+                zone_id=str(zone_id),
+                error=str(delete_exc),
+            )
+            reason = f"{reason}; зону удалить не вышло: {delete_exc}"
+    if deleted:
+        notice = f"аккаунт {email} не удалось пометить занятым ({reason}), зону удалил, беру следующий"
+    else:
+        notice = f"аккаунт {email} не удалось пометить занятым ({reason}), зону не трогаю, беру следующий"
+    if emit:
+        emit(notice)
+    done = state.setdefault("done", [])
+    if "zone" in done:
+        done.remove("zone")
+    state["zone_id"] = None
+    state["ns"] = []
+    state["zone_created"] = False
+    state["cf_crm_id"] = None
+    state.pop("cf_account", None)
+    state["failed_step"] = None
+    state["error"] = None
+    ident = str(account.get("id"))
+    release_account(ident)
+    banned = excluded if excluded is not None else []
+    if ident not in banned:
+        banned.append(ident)
+    state["cf_attempts"] = int(state.get("cf_attempts") or 0) + 1
+    if on_progress:
+        on_progress()
+    raise AccountUnusable(reason, notice)
 
 
 def _failed_step(done: list[str]) -> str:
@@ -281,6 +430,7 @@ def run_confirmed_batch(
     cf_factory: Callable[[dict[str, Any]], Any] | None = None,
     emit: Callable[[str], None] | None = None,
     on_progress: Callable[[], None] | None = None,
+    excluded_ids: list[str] | None = None,
 ) -> list[str]:
     """Покупает и настраивает пачку. Покупка падает точечно, остальные идут дальше."""
     if not confirmed:
@@ -288,6 +438,7 @@ def run_confirmed_batch(
     if not ip:
         raise DomainSetupError("Не задан IP")
     messages: list[str] = []
+    excluded = excluded_ids if excluded_ids is not None else []
 
     def say(text: str) -> None:
         messages.append(text)
@@ -300,7 +451,7 @@ def run_confirmed_batch(
     for state in pending:
         name = state["name"]
         try:
-            if "zone" not in state.get("done", []) and not _has_account_slot(state, free):
+            if "zone" not in state.get("done", []) and not _has_account_slot(state, free, excluded):
                 say(
                     f"Свободные аккаунты Cloudflare кончились ({len(free)} в списке). "
                     f"{name} и следующие домены не беру."
@@ -338,35 +489,64 @@ def run_confirmed_batch(
                 if on_progress:
                     on_progress()
 
-            account = _account_for_state(state, free)
-            if account is None:
-                state["failed_step"] = "zone"
-                state["error"] = "нет свободного аккаунта Cloudflare"
-                say(f"{name}: нет свободного аккаунта Cloudflare, останавливаюсь на остальных")
-                break
-            cf = (cf_factory or build_cf_client)(account)
-            try:
-                notes = setup_purchased_domain(
-                    state,
-                    dynadot=dynadot,
-                    account=account,
-                    cf=cf,
-                    crm=crm,
-                    ip=ip,
-                    today=today,
-                    emit=emit,
-                )
-            except DomainSetupError as exc:
-                if str(exc) not in messages:
-                    messages.append(str(exc))
+            if state.get("failed_step") == "cf_busy":
+                state["cf_attempts"] = 0
+                state["failed_step"] = None
+                state["error"] = None
+
+            while True:
+                if int(state.get("cf_attempts") or 0) >= MAX_CF_BUSY_ATTEMPTS:
+                    state["failed_step"] = "cf_busy"
+                    state["error"] = state.get("error") or "не удалось пометить аккаунт CF занятым"
+                    say(f"{name}: не вышло пометить аккаунт CF занятым за {state['cf_attempts']} попыток")
+                    if on_progress:
+                        on_progress()
+                    break
+                account = _account_for_state(state, free, excluded)
+                if account is None:
+                    state["failed_step"] = "zone"
+                    state["error"] = "нет свободного аккаунта Cloudflare"
+                    say(f"{name}: нет свободного аккаунта Cloudflare, останавливаюсь на остальных")
+                    if on_progress:
+                        on_progress()
+                    return messages
+                cf = (cf_factory or build_cf_client)(account)
+                try:
+                    notes = setup_purchased_domain(
+                        state,
+                        dynadot=dynadot,
+                        account=account,
+                        cf=cf,
+                        crm=crm,
+                        ip=ip,
+                        today=today,
+                        emit=emit,
+                        on_progress=on_progress,
+                        excluded=excluded,
+                    )
+                except AccountUnusable as exc:
+                    if exc.notice not in messages:
+                        messages.append(exc.notice)
+                    if int(state.get("cf_attempts") or 0) >= MAX_CF_BUSY_ATTEMPTS:
+                        state["failed_step"] = "cf_busy"
+                        state["error"] = str(exc)
+                        say(f"{name}: не вышло пометить аккаунт CF занятым за {state['cf_attempts']} попыток")
+                        if on_progress:
+                            on_progress()
+                        break
+                    continue
+                except DomainSetupError as exc:
+                    if str(exc) not in messages:
+                        messages.append(str(exc))
+                    if on_progress:
+                        on_progress()
+                    break
+                for line in notes:
+                    if line not in messages:
+                        messages.append(line)
                 if on_progress:
                     on_progress()
-                continue
-            for line in notes:
-                if line not in messages:
-                    messages.append(line)
-            if on_progress:
-                on_progress()
+                break
         except Exception as exc:
             state["failed_step"] = state.get("failed_step") or "buy"
             state["error"] = str(exc)
@@ -390,8 +570,14 @@ def remember_account(state: dict[str, Any], account: dict[str, Any]) -> None:
     }
 
 
-def _has_account_slot(state: dict[str, Any], free: list[dict[str, Any]]) -> bool:
-    if isinstance(state.get("cf_account"), dict):
+def _has_account_slot(
+    state: dict[str, Any],
+    free: list[dict[str, Any]],
+    excluded: list[str] | None = None,
+) -> bool:
+    banned = {str(item) for item in (excluded or [])}
+    stored = state.get("cf_account")
+    if isinstance(stored, dict) and stored.get("id") is not None and str(stored.get("id")) not in banned:
         return True
     with _ACCOUNT_LOCK:
         for account in free:
@@ -399,7 +585,7 @@ def _has_account_slot(state: dict[str, Any], free: list[dict[str, Any]]) -> bool
             status = account.get("status")
             if status not in (0, "0", None):
                 continue
-            if ident not in _RESERVED_IDS:
+            if ident not in _RESERVED_IDS and ident not in banned:
                 return True
     return False
 
@@ -415,11 +601,25 @@ def _ownership(dynadot: Any, name: str) -> tuple[bool, str | None]:
         return True, None
 
 
-def _account_for_state(state: dict[str, Any], free: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _account_for_state(
+    state: dict[str, Any],
+    free: list[dict[str, Any]],
+    excluded: list[str] | None = None,
+) -> dict[str, Any] | None:
+    banned = {str(item) for item in (excluded or [])}
     stored = state.get("cf_account")
     if isinstance(stored, dict) and stored.get("id") is not None:
-        return stored
-    account = take_free_account(free)
+        if str(stored.get("id")) not in banned:
+            return stored
+        state.pop("cf_account", None)
+        state["cf_crm_id"] = None
+        done = state.setdefault("done", [])
+        if "zone" in done:
+            done.remove("zone")
+        state["zone_id"] = None
+        state["ns"] = []
+        state["zone_created"] = False
+    account = take_free_account(free, banned)
     if account is not None:
         remember_account(state, account)
     return account

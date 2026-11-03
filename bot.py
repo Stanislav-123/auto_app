@@ -1963,6 +1963,7 @@ async def _execute_domain_purchase(
             cf_factory=None,
             emit=emit,
             on_progress=persist,
+            excluded_ids=job.setdefault("excluded_cf_ids", []),
         )
     except Exception as exc:
         emit(f"Остановка: {exc}")

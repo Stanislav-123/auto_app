@@ -1,12 +1,17 @@
+import copy
 import random
 import unittest
 from datetime import date
 from unittest.mock import patch
 
-from src.domains.cloudflare import cloudflare_auth_headers
+from src.domains.cloudflare import CloudflareClient, CloudflareError, cloudflare_auth_headers
 from src.domains.dynadot import DynadotError, expiration_to_date, parse_domain_info, parse_search_response, ensure_command_ok
 from src.domains.names import generate_candidate
-from src.domains.payloads import cloudflare_account_update_payload, domain_create_payload
+from src.domains.payloads import (
+    cloudflare_account_status_payload,
+    cloudflare_account_update_payload,
+    domain_create_payload,
+)
 from src.domains.pricing import expiration_in_one_year, is_affordable, parse_domain_list, parse_usd_price
 from src.domains.setup import (
     collect_affordable,
@@ -49,14 +54,23 @@ class FakeDyn:
 
 
 class FakeCF:
-    def __init__(self):
+    def __init__(self, created=True):
         self.calls = []
+        self.deleted = []
+        self.created = created
 
     def ensure_zone(self, name):
         self.calls.append(("zone", name))
         from src.domains.cloudflare import ZoneInfo
 
-        return ZoneInfo(id=f"z-{name}", name_servers=["ada.ns.cloudflare.com", "bob.ns.cloudflare.com"], created=True)
+        return ZoneInfo(
+            id=f"z-{name}",
+            name_servers=["ada.ns.cloudflare.com", "bob.ns.cloudflare.com"],
+            created=self.created,
+        )
+
+    def delete_zone(self, zone_id):
+        self.deleted.append(zone_id)
 
     def ensure_apex_a(self, zone_id, domain, ip):
         self.calls.append(("a", domain, ip))
@@ -175,7 +189,7 @@ class TestPurchaseGuard(unittest.TestCase):
         self.assertEqual(len(crm.created), 2)
         used_ids = [payload["cloudflare_accounts"][0]["cloudflare_account_id"] for payload in crm.created]
         self.assertEqual(len(set(used_ids)), 2)
-        self.assertEqual(len(crm.busy), 2)
+        self.assertEqual([payload for _, payload in crm.busy], [{"status": 1}, {"status": 1}])
 
     def test_specific_over_limit_is_not_silent(self):
         quotes = [
@@ -201,19 +215,20 @@ class TestCrmPayloads(unittest.TestCase):
     def test_exact_payloads_and_zone_ns(self):
         account = _account(15)
         ns0, ns1 = "ada.ns.cloudflare.com", "bob.ns.cloudflare.com"
+        self.assertEqual(cloudflare_account_status_payload(), {"status": 1})
         update = cloudflare_account_update_payload(account, ns0, ns1)
         self.assertEqual(
             update,
             {
                 "account_id": "cf-acc",
                 "auth_key": "cfk_15",
-                "email": "u15@cf.test",
                 "first_ns": ns0,
                 "second_ns": ns1,
                 "password": "secret-15",
                 "status": 1,
             },
         )
+        self.assertNotIn("email", update)
         created = domain_create_payload("backend42.top", account, expiration_in_one_year(date(2026, 11, 3)))
         self.assertEqual(
             created,
@@ -275,6 +290,14 @@ class TestCloudflareAuth(unittest.TestCase):
     def test_user_token_is_bearer(self):
         headers = cloudflare_auth_headers("a@b.c", "cfut_example")
         self.assertEqual(headers["Authorization"], "Bearer cfut_example")
+
+    def test_delete_zone(self):
+        client = CloudflareClient("a@b.c", "cfk_x", "acc")
+        with patch.object(client, "_request", return_value={"success": True}) as req:
+            client.delete_zone("zone-9")
+        req.assert_called_once_with("DELETE", "/zones/zone-9")
+        with patch.object(client, "_request", side_effect=CloudflareError("HTTP 404: gone")):
+            client.delete_zone("zone-9")
 
 
 class TestDomainList(unittest.TestCase):
@@ -349,6 +372,200 @@ class TestSetupOnly(unittest.TestCase):
             {"DomainInfoResponse": {"ResponseCode": -1, "Status": "error", "Error": "not found"}}
         )
         self.assertFalse(missing)
+
+
+BUSY_409 = 'HTTP 409: {"email":["Значение «u1@cf.test» для «Почта» уже занято."]}'
+
+
+class _BusyCRM(FakeCRM):
+    def __init__(self, accounts, fail_ids=None, error=BUSY_409, missing_fields=False, fallback_error=None):
+        super().__init__(accounts)
+        self.fail_ids = {str(item) for item in (fail_ids or [])}
+        self.error = error
+        self.missing_fields = missing_fields
+        self.fallback_error = fallback_error
+
+    def mark_cloudflare_account_busy(self, crm_id, payload):
+        self.busy.append((crm_id, payload))
+        if "email" in payload:
+            raise AssertionError(payload)
+        trouble = not self.fail_ids or str(crm_id) in self.fail_ids
+        if trouble and payload == {"status": 1} and self.missing_fields:
+            raise RuntimeError('password: Необходимо заполнить «Пароль».')
+        if trouble and payload != {"status": 1} and self.fallback_error:
+            raise RuntimeError(self.fallback_error)
+        if str(crm_id) in self.fail_ids:
+            raise RuntimeError(self.error)
+        for item in self.accounts:
+            if str(item.get("id")) == str(crm_id):
+                item["status"] = 1
+
+
+class TestBusyRollback(unittest.TestCase):
+    def setUp(self):
+        reset_reservations()
+
+    def _run(self, states, accounts, crm, created=True, excluded=None):
+        cfs = {}
+
+        def factory(account):
+            client = FakeCF(created=created)
+            cfs[account["id"]] = client
+            return client
+
+        snapshots = []
+
+        def progress():
+            snapshots.append(copy.deepcopy(states))
+
+        messages = run_confirmed_batch(
+            states,
+            dynadot=FakeDyn(),
+            crm=crm,
+            ip="5.75.214.90",
+            confirmed=True,
+            today=date(2026, 11, 3),
+            cf_factory=factory,
+            on_progress=progress,
+            excluded_ids=excluded,
+        )
+        return messages, cfs, snapshots
+
+    def test_status_only_then_fields_without_email(self):
+        crm = _BusyCRM([_account(1)], missing_fields=True)
+        states = [{"name": "keep.top", "done": []}]
+        messages, cfs, _snapshots = self._run(states, crm.accounts, crm)
+        self.assertEqual(crm.busy[0][1], {"status": 1})
+        self.assertEqual(
+            crm.busy[1][1],
+            {
+                "account_id": "cf-acc",
+                "auth_key": "cfk_1",
+                "first_ns": "ada.ns.cloudflare.com",
+                "second_ns": "bob.ns.cloudflare.com",
+                "password": "secret-1",
+                "status": 1,
+            },
+        )
+        self.assertEqual(len(crm.busy), 2)
+        self.assertEqual(cfs[1].deleted, [])
+        self.assertEqual(len(crm.created), 1)
+        self.assertIsNone(states[0].get("failed_step"))
+        self.assertTrue(any("занятым" in line for line in messages))
+
+    def test_conflict_deletes_created_zone_and_retries(self):
+        crm = _BusyCRM([_account(1), _account(2, "cf-2")], fail_ids={1})
+        excluded = []
+        states = [
+            {
+                "name": "keep.top",
+                "done": ["buy", "zone"],
+                "bought": True,
+                "zone_id": "z-keep.top",
+                "zone_created": True,
+                "ns": ["ada.ns.cloudflare.com", "bob.ns.cloudflare.com"],
+                "cf_crm_id": 1,
+                "cf_account": _account(1),
+            }
+        ]
+        dyn = FakeDyn()
+        cfs = {}
+
+        def factory(account):
+            client = FakeCF()
+            cfs[account["id"]] = client
+            return client
+
+        snapshots = []
+
+        def progress():
+            snapshots.append(copy.deepcopy(states[0]))
+
+        messages = run_confirmed_batch(
+            states,
+            dynadot=dyn,
+            crm=crm,
+            ip="5.75.214.90",
+            confirmed=True,
+            today=date(2026, 11, 3),
+            cf_factory=factory,
+            on_progress=progress,
+            excluded_ids=excluded,
+        )
+        notice = (
+            "аккаунт u1@cf.test не удалось пометить занятым "
+            f"({BUSY_409}), зону удалил, беру следующий"
+        )
+        self.assertIn(notice, messages)
+        self.assertEqual(dyn.registered, [])
+        self.assertEqual(cfs[1].deleted, ["z-keep.top"])
+        self.assertEqual(cfs[1].calls, [])
+        self.assertEqual(cfs[2].deleted, [])
+        self.assertEqual([call[0] for call in cfs[2].calls], ["zone", "a", "ssl"])
+        self.assertEqual([payload for _, payload in crm.busy], [{"status": 1}, {"status": 1}])
+        self.assertEqual(len(crm.created), 1)
+        self.assertEqual(states[0]["cf_account"]["id"], 2)
+        self.assertIn("zone", states[0]["done"])
+        self.assertIsNone(states[0].get("failed_step"))
+        rolled = next(item for item in snapshots if item.get("cf_attempts") == 1)
+        self.assertIsNone(rolled["zone_id"])
+        self.assertNotIn("cf_account", rolled)
+        self.assertNotIn("zone", rolled["done"])
+        self.assertIsNone(rolled["cf_crm_id"])
+        self.assertFalse(rolled["zone_created"])
+        self.assertEqual(excluded, ["1"])
+
+    def test_existing_zone_is_not_deleted(self):
+        crm = _BusyCRM([_account(1), _account(2, "cf-2")], fail_ids={1})
+        states = [{"name": "keep.top", "done": []}]
+        messages, cfs, _snapshots = self._run(states, crm.accounts, crm, created=False)
+        self.assertEqual(cfs[1].deleted, [])
+        self.assertEqual(cfs[2].deleted, [])
+        self.assertTrue(any("зону не трогаю" in line for line in messages))
+        self.assertFalse(any("зону удалил" in line for line in messages))
+        self.assertEqual(states[0]["cf_account"]["id"], 2)
+        self.assertEqual(len(crm.created), 1)
+
+    def test_fallback_reject_still_rolls_back(self):
+        crm = _BusyCRM(
+            [_account(1), _account(2, "cf-2")],
+            fail_ids={1},
+            missing_fields=True,
+            fallback_error=BUSY_409,
+        )
+        states = [{"name": "keep.top", "done": []}]
+        messages, cfs, _snapshots = self._run(states, crm.accounts, crm)
+        self.assertEqual(crm.busy[0][1], {"status": 1})
+        self.assertNotIn("email", crm.busy[1][1])
+        self.assertEqual(crm.busy[1][1]["status"], 1)
+        self.assertIn("account_id", crm.busy[1][1])
+        self.assertEqual(crm.busy[2][1], {"status": 1})
+        self.assertEqual(cfs[1].deleted, ["z-keep.top"])
+        self.assertEqual(states[0]["cf_account"]["id"], 2)
+        self.assertTrue(any("зону удалил" in line for line in messages))
+        self.assertEqual(len(crm.created), 1)
+
+    def test_stops_after_five_bad_accounts(self):
+        accounts = [_account(i, f"cf-{i}") for i in range(1, 7)]
+        crm = _BusyCRM(accounts, fail_ids=set(range(1, 6)))
+        excluded = []
+        states = [
+            {"name": "bad.top", "done": []},
+            {"name": "next.sbs", "done": []},
+        ]
+        messages, cfs, _snapshots = self._run(states, accounts, crm, excluded=excluded)
+        self.assertEqual(states[0]["failed_step"], "cf_busy")
+        self.assertEqual(states[0]["cf_attempts"], 5)
+        self.assertIsNone(states[0]["zone_id"])
+        self.assertNotIn("cf_account", states[0])
+        self.assertNotIn("zone", states[0]["done"])
+        self.assertIn("buy", states[0]["done"])
+        self.assertEqual([item["batch"] for item in crm.created], ["next.sbs"])
+        self.assertEqual(states[1]["cf_account"]["id"], 6)
+        self.assertEqual(sum(len(client.deleted) for client in cfs.values()), 5)
+        self.assertEqual(excluded, ["1", "2", "3", "4", "5"])
+        self.assertEqual(sum(1 for line in messages if "зону удалил" in line), 5)
+        self.assertTrue(any("5 попыток" in line for line in messages))
 
 
 class TestMasking(unittest.TestCase):
