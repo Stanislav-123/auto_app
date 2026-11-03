@@ -1575,11 +1575,13 @@ async def domain_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         _save_domain_job(update, context, job)
         await message.reply_text(
             "Покупка домена на Dynadot, затем Cloudflare и CRM.\n"
-            f"В пачке беру только .top/.sbs дешевле ${job['max_price']:.0f}.",
+            f"В пачке беру только .top/.sbs дешевле ${job['max_price']:.0f}.\n"
+            "Если домен уже куплен — «Только настройка».",
             reply_markup=InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton("Пачка случайных", callback_data="dom:mode:bulk")],
                     [InlineKeyboardButton("Конкретные имена", callback_data="dom:mode:specific")],
+                    [InlineKeyboardButton("Только настройка", callback_data="dom:mode:setup")],
                 ]
             ),
         )
@@ -1630,6 +1632,38 @@ async def _handle_domain_job_text(
             await message.reply_text("Подходящих доменов не нашлось.")
             return
         job["quotes"] = _quote_rows(quotes)
+        job["stage"] = "ip"
+        _save_domain_job(update, context, job)
+        await _ask_domain_ip(message, job)
+        return
+    if stage == "names" and job.get("mode") == "setup":
+        names = parse_domain_list(text)
+        if not names:
+            await message.reply_text(
+                "Не вижу доменов. Можно списком, через запятую или таблицей, "
+                "например https://www.backend42.top/"
+            )
+            return
+        await message.reply_text("Проверяю, что домены уже лежат в Dynadot…")
+        try:
+            ready, missing = await asyncio.to_thread(
+                _split_owned_domains,
+                DynadotClient(os.environ["DYNADOT_API_KEY"]),
+                names,
+            )
+        except Exception as exc:
+            await message.reply_text(f"Dynadot: {exc}")
+            return
+        if missing:
+            await message.reply_text(
+                "Нет в аккаунте Dynadot, пропускаю:\n" + "\n".join(missing)
+            )
+        if not ready:
+            job["stage"] = "done"
+            _save_domain_job(update, context, job)
+            await message.reply_text("Настраивать нечего.")
+            return
+        job["quotes"] = ready
         job["stage"] = "ip"
         _save_domain_job(update, context, job)
         await _ask_domain_ip(message, job)
@@ -1696,7 +1730,57 @@ async def _ask_domain_ip(message, job: dict[str, Any]) -> None:
     )
 
 
+def _split_owned_domains(dynadot: DynadotClient, names: list[str]) -> tuple[list[dict[str, Any]], list[str]]:
+    ready: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for name in names:
+        try:
+            owned, expires = dynadot.domain_record(name)
+        except Exception:
+            ready.append({"name": name, "available": True, "price": None, "expiration": None})
+            continue
+        if not owned:
+            missing.append(name)
+            continue
+        ready.append({"name": name, "available": True, "price": None, "expiration": expires})
+    return ready, missing
+
+
 async def _show_domain_confirm(message, job: dict[str, Any]) -> None:
+    if job.get("mode") == "setup":
+        rows = [row for row in (job.get("quotes") or []) if row.get("name")]
+        if not rows:
+            job["stage"] = "done"
+            await message.reply_text("Настраивать нечего.")
+            return
+        job["domains"] = [
+            {
+                "name": row["name"],
+                "price": None,
+                "done": [],
+                "skip_buy": True,
+                "expiration": row.get("expiration"),
+                "failed_step": None,
+                "error": None,
+                "bought": False,
+            }
+            for row in rows
+        ]
+        job["stage"] = "confirm"
+        job["confirmed"] = False
+        lines = "\n".join(f"• <code>{escape(row['name'])}</code>" for row in rows)
+        await message.reply_text(
+            f"Без покупки, только Cloudflare и CRM:\n{lines}\n"
+            f"IP: <code>{escape(str(job.get('ip')))}</code>\n\nПодтвердите запуск.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Настроить", callback_data="dom:buy:yes")],
+                    [InlineKeyboardButton("Отмена", callback_data="dom:buy:no")],
+                ]
+            ),
+        )
+        return
     quotes = select_for_purchase(
         _rows_to_quotes(job.get("quotes") or []),
         max_price=float(job["max_price"]),
@@ -1735,6 +1819,7 @@ async def _prompt_domain_stage(update: Update, context: ContextTypes.DEFAULT_TYP
                 [
                     [InlineKeyboardButton("Пачка случайных", callback_data="dom:mode:bulk")],
                     [InlineKeyboardButton("Конкретные имена", callback_data="dom:mode:specific")],
+                    [InlineKeyboardButton("Только настройка", callback_data="dom:mode:setup")],
                 ]
             ),
         )
@@ -1786,6 +1871,15 @@ async def handle_domain_callback(update: Update, context: ContextTypes.DEFAULT_T
             _save_domain_job(update, context, job)
             await query.message.reply_text("Пришлите точные имена, например backend42.top или несколько через запятую.")
             return
+        if data == "dom:mode:setup":
+            job["mode"] = "setup"
+            job["stage"] = "names"
+            _save_domain_job(update, context, job)
+            await query.message.reply_text(
+                "Пришлите уже купленные домены: столбиком, через запятую или как в таблице. "
+                "Покупать ничего не буду."
+            )
+            return
         if data == "dom:over:yes":
             job["allow_over_limit"] = True
             job["stage"] = "ip"
@@ -1808,7 +1902,10 @@ async def handle_domain_callback(update: Update, context: ContextTypes.DEFAULT_T
             job["stage"] = "done"
             job["confirmed"] = False
             _save_domain_job(update, context, job)
-            await query.message.reply_text("Покупка отменена. Деньги не списывал.")
+            if job.get("mode") == "setup":
+                await query.message.reply_text("Настройку отменил.")
+            else:
+                await query.message.reply_text("Покупка отменена. Деньги не списывал.")
             return
         if data in {"dom:buy:yes", "dom:retry"}:
             if data == "dom:buy:yes":
