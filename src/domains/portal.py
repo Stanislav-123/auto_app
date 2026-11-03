@@ -29,7 +29,7 @@ class PortalDomainClient:
         return free
 
     def mark_cloudflare_account_busy(self, crm_id: int, payload: dict[str, Any]) -> Any:
-        data = self.crm._request("POST", f"/cloudflare-account/update?id={crm_id}", payload)
+        data = self.crm._request("POST", f"/cloudflare-account/update?id={crm_id}", payload=payload)
         error = crm_result_error(data)
         if error:
             raise RuntimeError(error)
@@ -46,7 +46,7 @@ class PortalDomainClient:
         return False
 
     def create_portal_domain(self, payload: dict[str, Any]) -> Any:
-        data = self.crm._request("POST", "/domain/create", payload)
+        data = self.crm._request("POST", "/domain/create", payload=payload)
         error = crm_result_error(data)
         if error:
             raise RuntimeError(error)
