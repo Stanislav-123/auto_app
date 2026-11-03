@@ -4,6 +4,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from typing import Any
 
 from src.domains.pricing import DomainQuote, parse_usd_price
@@ -51,6 +52,20 @@ class DynadotClient:
         )
         ensure_command_ok(data, "RegisterResponse", "регистрация")
         return data
+
+    def domain_record(self, domain: str) -> tuple[bool, str | None]:
+        """Домен в аккаунте и дата окончания (YYYY-MM-DD), если Dynadot её отдал.
+
+        Сетевая ошибка пробрасывается. «Нет такого домена» — (False, None).
+        """
+        data = self._call(
+            {
+                "key": self.api_key,
+                "command": "domain_info",
+                "domain": domain,
+            }
+        )
+        return parse_domain_info(data)
 
     def set_ns(self, domain: str, ns0: str, ns1: str) -> dict[str, Any]:
         data = self._call(
@@ -123,6 +138,42 @@ def parse_search_response(data: dict[str, Any], *, fallback_name: str = "") -> l
     if not quotes and fallback_name:
         quotes.append(DomainQuote(name=fallback_name.lower(), available=False, price_usd=None))
     return quotes
+
+
+def parse_domain_info(data: dict[str, Any]) -> tuple[bool, str | None]:
+    block = data.get("DomainInfoResponse") if isinstance(data, dict) else None
+    if not isinstance(block, dict):
+        raise DynadotError(f"Нет DomainInfoResponse: {data}")
+    code = block.get("ResponseCode", block.get("SuccessCode"))
+    status = str(block.get("Status") or "").strip().lower()
+    if str(code) not in {"0", "0.0"} or (status and status not in {"success", "ok"}):
+        return False, None
+    info = block.get("DomainInfo")
+    if not isinstance(info, dict):
+        info = block
+    return True, expiration_to_date(info.get("Expiration"))
+
+
+def expiration_to_date(value: Any) -> str | None:
+    """Dynadot кладёт Expiration как unix-миллисекунды строкой."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) == 10 and text[4] == "-" and text[7] == "-":
+        return text
+    try:
+        stamp = int(float(text))
+    except ValueError:
+        return None
+    if stamp < 10_000_000_000:
+        stamp *= 1000
+    try:
+        moment = datetime.fromtimestamp(stamp / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return moment.date().isoformat()
 
 
 def ensure_command_ok(data: dict[str, Any], root: str, action: str) -> None:

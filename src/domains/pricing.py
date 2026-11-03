@@ -60,15 +60,27 @@ def is_ipv4(value: str) -> bool:
     return True
 
 
+_DOMAIN_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$")
+
+
+def clean_domain_token(token: str) -> str:
+    """Убрать схему, www, хвост пути и привести к нижнему регистру."""
+    name = (token or "").strip().lower()
+    name = re.sub(r"^https?://", "", name)
+    name = name.split("/")[0].split("?")[0].split("#")[0]
+    if name.startswith("www."):
+        name = name[4:]
+    return name.strip(".")
+
+
 def parse_domain_list(text: str) -> list[str]:
-    chunks = re.split(r"[\s,;]+", (text or "").strip().lower())
+    """Строки, запятые, пробелы и вставленные колонки таблицы. Дубли выкидываем."""
+    chunks = re.split(r"[\s,;|]+", text or "")
     names: list[str] = []
     seen: set[str] = set()
     for chunk in chunks:
-        name = chunk.strip(".")
-        if not name or "." not in name or name in seen:
-            continue
-        if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*\.[a-z]{2,}", name):
+        name = clean_domain_token(chunk)
+        if not name or name in seen or not _DOMAIN_RE.fullmatch(name):
             continue
         seen.add(name)
         names.append(name)
