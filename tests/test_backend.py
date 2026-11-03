@@ -1,10 +1,12 @@
+import os
 import unittest
+from unittest.mock import patch
 
 from src.backend.constants import (
     GEO_ALLOWED_CODES,
-    NEW_BACKEND_APPSFLYER_KEY,
-    NEW_BACKEND_APPSFLYER_KEY_API_V2,
-    NEW_BACKEND_BINOM_URL,
+    appsflyer_api_v2_key,
+    appsflyer_dev_key,
+    binom_tracker_url,
     geo_allowed_android,
     geo_allowed_new,
     geo_allowed_old,
@@ -35,11 +37,26 @@ class TestGeoFormats(unittest.TestCase):
 
 
 class TestNewBackendConstants(unittest.TestCase):
-    def test_fixed_values(self):
-        self.assertEqual(NEW_BACKEND_BINOM_URL, "https://grand4clickz.com/c5wzl6k.php")
-        self.assertEqual(NEW_BACKEND_APPSFLYER_KEY, "P8Cmc5f5JjkNjQ3haoGbWS")
-        self.assertTrue(NEW_BACKEND_APPSFLYER_KEY_API_V2.startswith("eyJ"))
-        self.assertNotIn(" ", NEW_BACKEND_APPSFLYER_KEY_API_V2)
+    def test_reads_env(self):
+        with patch.dict(
+            os.environ,
+            {
+                "BACKEND_BINOM_URL": "https://tracker.example/click.php",
+                "APPSFLYER_DEV_KEY": "devkey",
+                "APPSFLYER_API_V2_KEY": "v2key",
+            },
+            clear=False,
+        ):
+            self.assertEqual(binom_tracker_url(), "https://tracker.example/click.php")
+            self.assertEqual(appsflyer_dev_key(), "devkey")
+            self.assertEqual(appsflyer_api_v2_key(), "v2key")
+            self.assertNotIn(" ", appsflyer_api_v2_key())
+
+    def test_empty_without_env(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(binom_tracker_url(), "")
+            self.assertEqual(appsflyer_dev_key(), "")
+            self.assertEqual(appsflyer_api_v2_key(), "")
 
 
 class TestBinomKeyExtract(unittest.TestCase):
@@ -74,13 +91,18 @@ class TestAndroidHelpers(unittest.TestCase):
         )
 
     def test_organic_link_from_key(self):
-        self.assertEqual(
-            build_android_organic_link(key="20aem9pgxubiwwlv8nay"),
-            "https://grand4clickz.com/c5wzl6k.php?key=20aem9pgxubiwwlv8nay",
-        )
+        with patch.dict(
+            os.environ,
+            {"BACKEND_BINOM_URL": "https://tracker.example/click.php"},
+            clear=False,
+        ):
+            self.assertEqual(
+                build_android_organic_link(key="testkey"),
+                "https://tracker.example/click.php?key=testkey",
+            )
 
     def test_organic_link_keeps_url_with_key(self):
-        url = "https://grand4clickz.com/c5wzl6k.php?key=abc"
+        url = "https://tracker.example/click.php?key=abc"
         self.assertEqual(build_android_organic_link(url=url, key="other"), url)
 
     def test_organic_link_keeps_other_tracker_domain(self):

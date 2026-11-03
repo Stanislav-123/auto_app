@@ -14,7 +14,11 @@ from src.crm.payload import (
     build_create_app_payload,
     resolve_apps_created_by,
 )
-from src.crm.zip_assets import classify_image_filename, extract_crm_images_from_zip
+from src.crm.zip_assets import (
+    classify_image_filename,
+    extract_crm_images_from_zip,
+    safe_zip_filename,
+)
 from src.models import ParsedApp, Platform
 from src.parser import parse_app_message
 from tests.test_parser import ANDROID_MESSAGE, IOS_MESSAGE
@@ -115,6 +119,19 @@ class TestZipAssets(unittest.TestCase):
             self.assertEqual(set(result.keys()), {"logo", "banner", "banner_appcraft", "slider"})
             for value in result.values():
                 self.assertTrue(value.startswith("data:image/"))
+
+    def test_rejects_oversized_archive(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            zip_path = tmp_path / "assets.zip"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("logo.png", b"x" * 50)
+            with self.assertRaises(ValueError):
+                extract_crm_images_from_zip(zip_path, tmp_path / "out", max_uncompressed=10)
+
+    def test_safe_zip_filename(self):
+        self.assertEqual(safe_zip_filename("../../etc/passwd"), "passwd.zip")
+        self.assertEqual(safe_zip_filename("my images.zip"), "my_images.zip")
 
 
 if __name__ == "__main__":

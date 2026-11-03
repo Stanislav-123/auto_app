@@ -114,6 +114,35 @@ Backend: Новый
         self.assertEqual(app.bundle, "cot.cross.repairly")
         self.assertTrue(is_parse_complete(app))
 
+    def test_domain_with_comment_and_indent(self):
+        msg = """\
+Новое IOS приложение
+
+App
+https://apps.apple.com/ru/app/app/id1
+
+  Backend Domain: Foo-Bar.sbs (куплен)
+Bundle: com.example.app
+Backend: Новый
+"""
+        app = parse_app_message(msg)
+        self.assertEqual(app.backend_domain, "foo-bar.sbs")
+        self.assertEqual(app.backend, "Новый")
+
+    def test_loose_domain_label(self):
+        msg = """\
+Новое IOS приложение
+
+App
+https://apps.apple.com/ru/app/app/id2
+
+Bundle: com.example.app
+Домен: other.sbs
+Backend: Новый
+"""
+        app = parse_app_message(msg)
+        self.assertEqual(app.backend_domain, "other.sbs")
+
     def test_merge_platform_reply(self):
         incomplete = parse_app_message("TEST\nBundle: com.example.app")
         self.assertEqual(incomplete.platform.value, "unknown")

@@ -11,11 +11,12 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .constants import (
-    NEW_BACKEND_APPSFLYER_KEY,
-    NEW_BACKEND_APPSFLYER_KEY_API_V2,
-    NEW_BACKEND_BINOM_URL,
+    appsflyer_api_v2_key,
+    appsflyer_dev_key,
+    binom_tracker_url,
     geo_allowed_new,
 )
+from src.http_errors import transport_failure
 from src.workflow.http_log import log_request, log_response
 
 
@@ -69,6 +70,12 @@ class NewBackendClient:
             details = exc.read().decode("utf-8", "replace")
             log_response("backend-new", "POST", login_url, exc.code, details)
             raise NewBackendError(f"Login HTTP {exc.code}: {details[:200]}") from exc
+        except Exception as exc:
+            failure = transport_failure(exc)
+            if failure is None:
+                raise
+            log_response("backend-new", "POST", login_url, "error", failure)
+            raise NewBackendError(failure) from exc
 
         log_response("backend-new", "POST", login_url, status, f"final_url={final_url} html_len={len(html)}")
         if "/login" in final_url and "username" in html and "password" in html:
@@ -141,11 +148,19 @@ class NewBackendClient:
         html = self._get(edit_url)
         form_data = _parse_form_fields(html)
 
+        tracker_url = binom_tracker_url()
+        af_key = appsflyer_dev_key()
+        af_v2 = appsflyer_api_v2_key()
+        if not tracker_url:
+            raise NewBackendError("Не задан BACKEND_BINOM_URL")
+        if not af_key or not af_v2:
+            raise NewBackendError("Не заданы APPSFLYER_DEV_KEY и APPSFLYER_API_V2_KEY")
+
         form_data["settings_geo_allowed"] = geo_allowed_new()
         form_data["settings_binom_key"] = binom_key
-        form_data["settings_binom_url"] = NEW_BACKEND_BINOM_URL
-        form_data["settings_appsflyer_key"] = NEW_BACKEND_APPSFLYER_KEY
-        form_data["settings_appsflyer_key_api_v2"] = NEW_BACKEND_APPSFLYER_KEY_API_V2
+        form_data["settings_binom_url"] = tracker_url
+        form_data["settings_appsflyer_key"] = af_key
+        form_data["settings_appsflyer_key_api_v2"] = af_v2
 
         body = urllib.parse.urlencode(form_data).encode("utf-8")
         log_request(
@@ -154,7 +169,7 @@ class NewBackendClient:
             edit_url,
             {
                 "settings_binom_key": binom_key,
-                "settings_binom_url": NEW_BACKEND_BINOM_URL,
+                "settings_binom_url": tracker_url,
                 "settings_geo_allowed": f"<geo codes={len(form_data['settings_geo_allowed'].split(','))}>",
                 "fields": sorted(form_data.keys()),
             },
@@ -183,6 +198,12 @@ class NewBackendClient:
             details = exc.read().decode("utf-8", "replace")
             log_response("backend-new", "POST", edit_url, exc.code, details)
             raise NewBackendError(f"Save HTTP {exc.code}: {details[:200]}") from exc
+        except Exception as exc:
+            failure = transport_failure(exc)
+            if failure is None:
+                raise
+            log_response("backend-new", "POST", edit_url, "error", failure)
+            raise NewBackendError(failure) from exc
 
     def _get(self, url: str) -> str:
         log_request("backend-new", "GET", url)
@@ -202,6 +223,12 @@ class NewBackendClient:
             details = exc.read().decode("utf-8", "replace")
             log_response("backend-new", "GET", url, exc.code, details)
             raise NewBackendError(f"GET {url} HTTP {exc.code}: {details[:200]}") from exc
+        except Exception as exc:
+            failure = transport_failure(exc)
+            if failure is None:
+                raise
+            log_response("backend-new", "GET", url, "error", failure)
+            raise NewBackendError(failure) from exc
 
 
 def _parse_form_fields(html: str) -> dict[str, str]:

@@ -17,6 +17,11 @@ _SENSITIVE_KEYS = {
     "fb_access_token",
     "fb_decryption_key",
     "settings_appsflyer_key_api_v2",
+    "appsflyer_dev_key",
+    "appsflyer_key",
+    "facebook_decryption_key",
+    "auth_key",
+    "x-auth-key",
 }
 
 _BINARYISH_KEYS = {
@@ -89,8 +94,12 @@ def format_body(body: Any, limit: int = 2000) -> str:
     return _truncate(str(body), limit)
 
 
+def mask_url(url: str) -> str:
+    return re.sub(r"((?:api_key|key)=)[^&]+", r"\1***", url, flags=re.I)
+
+
 def log_request(service: str, method: str, url: str, body: Any = None) -> None:
-    safe_url = re.sub(r"(api_key=)[^&]+", r"\1***", url, flags=re.I)
+    safe_url = mask_url(url)
     logger.info("REQ %s %s %s body=%s", service, method.upper(), safe_url, format_body(body))
 
 
@@ -101,7 +110,7 @@ def log_response(
     status: int | str,
     body: Any = None,
 ) -> None:
-    safe_url = re.sub(r"(api_key=)[^&]+", r"\1***", url, flags=re.I)
+    safe_url = mask_url(url)
     logger.info(
         "RESP %s %s %s status=%s body=%s",
         service,

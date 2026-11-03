@@ -24,6 +24,7 @@ _PERSIST_KEYS = {
     "backend",
     "awaiting_missing",
     "awaiting_after",
+    "awaiting_app",
     "awaiting_domain",
     "awaiting_android_fb",
     "android_fb",
@@ -40,6 +41,9 @@ _PERSIST_KEYS = {
     "dev_back_android",
     "app_key",
     "crm_needs_recollect",
+    "failed_step",
+    "failed_error",
+    "domain_job",
 }
 
 
@@ -192,6 +196,13 @@ def resume_step(wf: dict[str, Any]) -> Optional[WorkflowStep]:
         return WorkflowStep.DOMAIN
     if wf.get("crm_needs_recollect") or wf.get("crm_awaiting_theme") or wf.get("crm_ready"):
         return WorkflowStep.CRM
+
+    failed = wf.get("failed_step")
+    if isinstance(failed, str):
+        try:
+            return WorkflowStep(failed)
+        except ValueError:
+            pass
 
     completed = list(wf.get("completed_steps") or [])
     if not completed:

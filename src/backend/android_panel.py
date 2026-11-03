@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from .constants import NEW_BACKEND_APPSFLYER_KEY, NEW_BACKEND_BINOM_URL, geo_allowed_android
+from .constants import appsflyer_dev_key, binom_tracker_url, geo_allowed_android
+from src.http_errors import transport_failure
 from src.workflow.http_log import log_request, log_response
 
 
@@ -52,7 +53,10 @@ def build_android_organic_link(*, url: str | None = None, key: str | None = None
             return f"{raw_url}{sep}key={raw_key}"
     if raw_key:
         # DEV/fallback only — production should pass campaign URL from Binom.
-        return f"{NEW_BACKEND_BINOM_URL}?key={raw_key}"
+        base = binom_tracker_url()
+        if not base:
+            return ""
+        return f"{base}?key={raw_key}"
     return raw_url
 
 
@@ -163,7 +167,10 @@ class AndroidBackendClient:
         form_data["fb_app_id"] = fb_app_id.strip()
         form_data["fb_access_token"] = fb_access_token.strip()
         form_data["fb_decryption_key"] = fb_decryption_key.strip()
-        form_data["apps_devkey"] = NEW_BACKEND_APPSFLYER_KEY
+        af_key = appsflyer_dev_key()
+        if not af_key:
+            raise AndroidBackendError("Не задан APPSFLYER_DEV_KEY")
+        form_data["apps_devkey"] = af_key
         form_data["organic_link"] = organic_link.strip()
         form_data["mmp_used"] = "0"
         form_data["geo_allowed"] = geo_allowed_android()
@@ -209,6 +216,12 @@ class AndroidBackendClient:
             details = exc.read().decode("utf-8", "replace")
             log_response("backend-android", "POST", save_url, exc.code, details)
             raise AndroidBackendError(f"Save HTTP {exc.code}: {details[:200]}") from exc
+        except Exception as exc:
+            failure = transport_failure(exc)
+            if failure is None:
+                raise
+            log_response("backend-android", "POST", save_url, "error", failure)
+            raise AndroidBackendError(failure) from exc
 
         app.panel_id = form_data["id"]
         app.bundle_name = form_data.get("bundle_name") or app.bundle_name
@@ -240,6 +253,12 @@ class AndroidBackendClient:
             details = exc.read().decode("utf-8", "replace")
             log_response("backend-android", "GET", url, exc.code, details)
             raise AndroidBackendError(f"GET {url} HTTP {exc.code}: {details[:200]}") from exc
+        except Exception as exc:
+            failure = transport_failure(exc)
+            if failure is None:
+                raise
+            log_response("backend-android", "GET", url, "error", failure)
+            raise AndroidBackendError(failure) from exc
         if "name=\"username\"" in html and "login" in html.lower():
             raise AndroidBackendError("Android-бэкенд вернул страницу логина (проверьте Basic Auth)")
         return html

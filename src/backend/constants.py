@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 # Shared GEO allowlist for all backends (same countries, different separators).
 GEO_ALLOWED_CODES: list[str] = [
     "AL", "AT", "BE", "BA", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR",
@@ -33,17 +35,18 @@ def geo_allowed_android() -> str:
     return " ".join(GEO_ALLOWED_CODES)
 
 
-# Fixed values for new backend panel.
-NEW_BACKEND_BINOM_URL = "https://grand4clickz.com/c5wzl6k.php"
-NEW_BACKEND_APPSFLYER_KEY = "P8Cmc5f5JjkNjQ3haoGbWS"
-NEW_BACKEND_APPSFLYER_KEY_API_V2 = (
-    "eyJhbGciOiJBMjU2S1ciLCJjdHkiOiJKV1QiLCJlbmMiOiJBMjU2R0NNIiwidHlwIjoiSldUIiwiemlwIjoiREVGIn0."
-    "pjmUHeqheocCex8rwohaRDee92nY4jNulAb1krNdfKOCGB30qALopw.NghBL8r_47uDuo0q."
-    "4-WfSXzS7KKD5fu90ltFFR3EdnJF5rU0cmUtBhAc3aRrITKv2Oml1FHqcr8tjkyh3ZLgZEiDJx1C5SGgVpv0cXcC"
-    "Yko45k3nt2eZYt4qMTXEbYj5zS-dHo3PQe1HsBapKlrreUtxQpl9lRa2EDMNzCfT7Z19FPqyiyekjkB64Q0WxYvZE"
-    "e1IaG6y9dkfwlnOTAfL_ImqLgvPHd0LlP0V8DU4vMhvnrq-rWXWWzxlU6dDap-9-CVyxlA5pjxNrLN4i_zCqpMaig"
-    "lElRTS8f8syCImrlmnfUBDJ95a_agnwlY-N3HKyQBbLTEd4-WB_ylGRxrIFeK5l0CQPMDtNNz-H3GRH_0bUM-jSpX"
-    "umSIyE-Viwo2C5CKRlfJXSrBUVSMsUeQCRQG1m_46NeYnM3Mwe0xOuIiGM8Qw99BbpY7TgnZsqj0e1JX-y01UaqFx"
-    "9qVI5J-LgXIT6_7Ev9U9SLgSUADKmSpJADPSxmsud9AyAr4MNrTEL2f6r-dFv2k1b0YzHKpqar6W0j38eV1Jqepq"
-    "SEU.O6o9cTLXl5SVWz-7YvZoGg"
-)
+def _env(name: str) -> str:
+    return os.getenv(name, "").strip()
+
+
+def binom_tracker_url() -> str:
+    """Click URL трекера (без key). Задаётся в BACKEND_BINOM_URL."""
+    return _env("BACKEND_BINOM_URL")
+
+
+def appsflyer_dev_key() -> str:
+    return _env("APPSFLYER_DEV_KEY")
+
+
+def appsflyer_api_v2_key() -> str:
+    return _env("APPSFLYER_API_V2_KEY")

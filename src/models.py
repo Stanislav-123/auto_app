@@ -68,3 +68,27 @@ class ParsedApp:
             "missing_fields": self.missing_fields,
             "raw_text": self.raw_text,
         }
+
+
+def parsed_from_dict(data: dict) -> ParsedApp:
+    platform_raw = data.get("platform") or Platform.UNKNOWN.value
+    try:
+        platform = Platform(platform_raw)
+    except ValueError:
+        platform = Platform.UNKNOWN
+    return ParsedApp(
+        platform=platform,
+        name=data.get("name"),
+        store_url=data.get("store_url"),
+        store_id=data.get("store_id"),
+        bundle=data.get("bundle"),
+        backend_domain=data.get("backend_domain"),
+        appsflyer=data.get("appsflyer"),
+        owner=data.get("owner"),
+        pushes=data.get("pushes"),
+        developer_site=data.get("developer_site"),
+        backend=data.get("backend"),
+        firebase_name=data.get("firebase_name"),
+        raw_text=data.get("raw_text", ""),
+        missing_fields=list(data.get("missing_fields") or []),
+    )

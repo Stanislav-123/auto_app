@@ -2,11 +2,20 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from src.workflow.http_log import log_request, log_response
+from src.crm.domain import (
+    build_app_domain_payload,
+    build_rules_domain_payload,
+    crm_result_error,
+    is_domain_not_found,
+    normalize_backend_domain,
+)
+from src.http_errors import transport_failure
+from src.workflow.http_log import log_request, log_response, log_step
 
 
 class CrmError(Exception):
@@ -88,45 +97,147 @@ class CrmClient:
             },
         )
 
-    def set_app_domain(self, app_id: int, domain: str) -> Any:
-        """Bind backend domain to CRM app the same way UI does.
+    def list_apps(self, search: str) -> list[dict[str, Any]]:
+        query = urllib.parse.urlencode({"search": search, "page": 1, "per-page": 50})
+        data = self._request("GET", f"/app/index?{query}")
+        models = data.get("models") if isinstance(data, dict) else None
+        if not isinstance(models, list):
+            return []
+        return [item for item in models if isinstance(item, dict)]
 
-        1) GET /app/rules-view?id=...
-        2) set model.domain
-        3) POST /app/rules-update?id=... with full model
+    def find_existing_app(
+        self,
+        *,
+        store_id: str | None = None,
+        bundle: str | None = None,
+        name: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Найти карточку приложения по bundle/store id, иначе по точному имени."""
+        needles = []
+        for value in (store_id, bundle, name):
+            text = (value or "").strip()
+            if text and text not in needles:
+                needles.append(text)
+
+        seen: set[str] = set()
+        candidates: list[dict[str, Any]] = []
+        for needle in needles:
+            for item in self.list_apps(needle):
+                ident = str(item.get("id"))
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                candidates.append(item)
+
+        for item in candidates:
+            if _app_id_match(item, store_id=store_id, bundle=bundle):
+                return item
+        name_norm = (name or "").strip().lower()
+        if name_norm:
+            for item in candidates:
+                app_name = str(item.get("apps_name") or item.get("name") or "").strip().lower()
+                if app_name == name_norm:
+                    return item
+        return None
+
+    def find_catalog_domain(self, domain: str) -> str | None:
+        """Точное имя из справочника /domain/index, если домен там уже есть."""
+        hostname = normalize_backend_domain(domain)
+        if not hostname:
+            return None
+        query = urllib.parse.urlencode({"search": hostname, "page": 1, "per-page": 50})
+        try:
+            data = self._request("GET", f"/domain/index?{query}")
+        except CrmError as exc:
+            log_step("crm_domain_catalog_failed", domain=hostname, error=str(exc))
+            return None
+        models = data.get("models") if isinstance(data, dict) else None
+        if not isinstance(models, list):
+            return None
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            raw = str(item.get("domain") or "").strip()
+            if normalize_backend_domain(raw) == hostname:
+                return raw
+        return None
+
+    def set_app_domain(self, app_id: int, domain: str) -> dict[str, Any]:
+        """Привязать домен так же, как это делает портал.
+
+        1. Справочник /domain/index — берём каноническое имя, если домен уже заведён.
+        2. POST /app/update с app_domain (экран «Настройки бэкенда»).
+        3. POST /app/rules-update с полной моделью и полем domain (экран «Правила»).
+
+        Раньше уходил только rules-update, а пустой model.domain в ответе считался
+        ошибкой, даже если строка домена в теле была.
         """
-        view = self._request("GET", f"/app/rules-view?id={app_id}")
-        if isinstance(view, dict) and view.get("error"):
-            raise CrmError(view.get("msg_error") or f"CRM rules-view error: {view}")
+        hostname = normalize_backend_domain(domain)
+        if not hostname:
+            raise CrmError(f"Некорректный домен: {domain}")
 
-        model = view.get("model") if isinstance(view, dict) else None
-        if not isinstance(model, dict):
-            # Fallback: create/update via compact payload if model missing.
-            model = {"apps_id": app_id}
+        catalog_name = self.find_catalog_domain(hostname)
+        saved_name = catalog_name or hostname
 
-        model = dict(model)
-        model["domain"] = domain
-        model["apps_id"] = app_id
+        view = self._request("GET", f"/app/view?id={app_id}")
+        view_error = crm_result_error(view)
+        if view_error:
+            raise CrmError(f"CRM app/view: {view_error}")
 
-        result = self._request(
-            "POST",
-            f"/app/rules-update?id={app_id}",
-            payload=model,
+        update_payload = build_app_domain_payload(view, saved_name)
+        log_step(
+            "crm_app_domain",
+            app_id=app_id,
+            domain=saved_name,
+            catalog=bool(catalog_name),
+            fields=sorted(update_payload.keys()),
         )
-        if isinstance(result, dict):
-            if result.get("error"):
-                raise CrmError(result.get("msg_error") or f"CRM rules-update error: {result}")
-            if result.get("success") is False:
-                raise CrmError(result.get("msg_error") or f"CRM rules-update failed: {result}")
-            saved_model = result.get("model")
-            if isinstance(saved_model, dict):
-                saved_domain = saved_model.get("domain")
-                if not saved_domain:
-                    raise CrmError(
-                        result.get("msg_error")
-                        or "CRM не сохранила домен (domain остался пустым)"
-                    )
-        return result
+        update_result = self._request("POST", f"/app/update?id={app_id}", payload=update_payload)
+        update_error = crm_result_error(update_result)
+        if update_error:
+            raise CrmError(f"CRM app/update: {update_error}")
+
+        rules_view = self._request("GET", f"/app/rules-view?id={app_id}")
+        rules_view_error = crm_result_error(rules_view)
+        if rules_view_error:
+            raise CrmError(f"CRM rules-view: {rules_view_error}")
+
+        rules_payload = build_rules_domain_payload(rules_view, app_id, saved_name)
+        log_step(
+            "crm_rules_domain",
+            app_id=app_id,
+            domain=rules_payload.get("domain"),
+            apps_id=rules_payload.get("apps_id"),
+        )
+        try:
+            rules_result = self._request(
+                "POST",
+                f"/app/rules-update?id={app_id}",
+                payload=rules_payload,
+            )
+        except CrmError as exc:
+            if is_domain_not_found(str(exc)) and not catalog_name:
+                raise CrmError(
+                    f"CRM не нашла домен «{saved_name}» в справочнике. "
+                    f"В запрос ушли app_domain и rules.domain={saved_name}. {exc}"
+                ) from exc
+            raise
+
+        rules_error = crm_result_error(rules_result)
+        if rules_error:
+            if is_domain_not_found(rules_error) and not catalog_name:
+                raise CrmError(
+                    f"CRM не нашла домен «{saved_name}» в справочнике. "
+                    f"В запрос ушли app_domain и rules.domain={saved_name}. {rules_error}"
+                )
+            raise CrmError(f"CRM rules-update: {rules_error}")
+
+        return {
+            "domain": saved_name,
+            "catalog": bool(catalog_name),
+            "app_update": update_result,
+            "rules": rules_result,
+        }
 
     def _request(
         self,
@@ -167,9 +278,12 @@ class CrmClient:
             except json.JSONDecodeError:
                 pass
             raise CrmError(f"HTTP {exc.code}: {message}") from exc
-        except urllib.error.URLError as exc:
-            log_response("crm", method, url, "error", str(exc.reason))
-            raise CrmError(f"Не удалось подключиться к CRM: {exc.reason}") from exc
+        except Exception as exc:
+            failure = transport_failure(exc)
+            if failure is None:
+                raise
+            log_response("crm", method, url, "error", failure)
+            raise CrmError(failure) from exc
 
         if not raw:
             log_response("crm", method, url, status, {})
@@ -183,3 +297,21 @@ class CrmClient:
 
         log_response("crm", method, url, status, data)
         return data
+
+
+def _norm(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _app_id_match(
+    item: dict[str, Any],
+    *,
+    store_id: str | None,
+    bundle: str | None,
+) -> bool:
+    apps_bundle = _norm(item.get("apps_bundle"))
+    bund = _norm(item.get("bundle"))
+    wanted = {_norm(store_id), _norm(bundle)} - {""}
+    if not wanted:
+        return False
+    return bool(wanted & {apps_bundle, bund})

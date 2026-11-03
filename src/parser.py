@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+from .crm.domain import normalize_backend_domain
 from .models import ParsedApp, Platform
 
 # --- URL patterns ---
@@ -20,42 +21,46 @@ ANY_URL_RE = re.compile(r"https?://\S+")
 # --- Labeled field patterns (label : value) ---
 
 FIELD_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("bundle", re.compile(r"^Bundle\s*[:：\-–—]\s*(.+)$", re.IGNORECASE | re.MULTILINE)),
+    ("bundle", re.compile(r"^\s*Bundle\s*[:：\-–—]\s*(.+)$", re.IGNORECASE | re.MULTILINE)),
     (
         "backend_domain",
-        re.compile(r"^Backend\s+Domain\s*[:：\-–—]\s*(.+)$", re.IGNORECASE | re.MULTILINE),
+        re.compile(r"^\s*Backend\s+Domain\s*[:：\-–—]\s*(.+)$", re.IGNORECASE | re.MULTILINE),
     ),
     (
         "appsflyer",
-        re.compile(r"^Appsflyer\s*[:：\-–—]\s*(.+)$", re.IGNORECASE | re.MULTILINE),
+        re.compile(r"^\s*Appsflyer\s*[:：\-–—]\s*(.+)$", re.IGNORECASE | re.MULTILINE),
     ),
     (
         "owner",
-        re.compile(r"^Чья\s+прила\s*[:：\-–—]\s*(.+)$", re.IGNORECASE | re.MULTILINE),
+        re.compile(r"^\s*Чья\s+прила\s*[:：\-–—]\s*(.+)$", re.IGNORECASE | re.MULTILINE),
     ),
     (
         "pushes",
-        re.compile(r"^Пуши\s*[:：\-–—]\s*(.+)$", re.IGNORECASE | re.MULTILINE),
+        re.compile(r"^\s*Пуши\s*[:：\-–—]\s*(.+)$", re.IGNORECASE | re.MULTILINE),
     ),
     (
         "developer_site",
         re.compile(
-            r"^Сайт\s+разработчика\s*[:：\-–—]\s*(.+)$",
+            r"^\s*Сайт\s+разработчика\s*[:：\-–—]\s*(.+)$",
             re.IGNORECASE | re.MULTILINE,
         ),
     ),
     (
         "backend",
-        re.compile(r"^Backend\s*[:：\-–—]\s*(.+)$", re.IGNORECASE | re.MULTILINE),
+        re.compile(r"^\s*Backend\s*[:：\-–—]\s*(.+)$", re.IGNORECASE | re.MULTILINE),
     ),
     (
         "firebase_name",
         re.compile(
-            r"^Название\s+в\s+Firebase\s*[:：\-–—]\s*(.+)$",
+            r"^\s*Название\s+в\s+Firebase\s*[:：\-–—]\s*(.+)$",
             re.IGNORECASE | re.MULTILINE,
         ),
     ),
 ]
+
+LOOSE_DOMAIN_RE = re.compile(
+    r"(?im)^\s*(?:[-•*]+\s*)?(?:домен(?:\s+б[еэ]ка)?|domain)\s*[:：\-–—]\s*(\S+)",
+)
 
 PLATFORM_HEADER_RE = re.compile(
     r"новое\s+(ios|android|андроид)\s+приложение",
@@ -286,6 +291,15 @@ def parse_app_message(text: str) -> ParsedApp:
     elif platform == Platform.ANDROID:
         app.store_id = app.bundle
 
+    if not app.backend_domain:
+        loose = LOOSE_DOMAIN_RE.search(text)
+        if loose:
+            app.backend_domain = loose.group(1).strip()
+    if app.backend_domain:
+        cleaned = normalize_backend_domain(app.backend_domain)
+        if cleaned:
+            app.backend_domain = cleaned
+
     app.missing_fields = _collect_missing_fields(app)
 
     return app
@@ -358,6 +372,11 @@ def merge_missing_reply(app: ParsedApp, reply_text: str) -> ParsedApp:
         if not updated.bundle and updated.store_url:
             updated.bundle = _extract_android_bundle_from_url(updated.store_url)
         updated.store_id = updated.bundle
+
+    if updated.backend_domain:
+        cleaned = normalize_backend_domain(updated.backend_domain)
+        if cleaned:
+            updated.backend_domain = cleaned
 
     updated.missing_fields = _collect_missing_fields(updated)
     return updated

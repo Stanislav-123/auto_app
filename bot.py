@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Telegram-бот для пошагового завода приложений."""
 
+import asyncio
 import logging
 import os
 import re
@@ -39,12 +40,34 @@ from src.crm import (
     parse_apns_key_file,
     resolve_apps_created_by,
 )
+from src.config import allowed_user_ids
 from src.crm.domain import normalize_backend_domain
+from src.crm.zip_assets import safe_upload_filename, safe_zip_filename
 
 from src.formatter import format_missing_prompt, format_parsed_app, is_parse_complete
-from src.models import ParsedApp, Platform
+from src.models import ParsedApp, Platform, parsed_from_dict
 from src.parser import merge_missing_reply, parse_app_message
+from src.domains.dynadot import DynadotClient
+from src.domains.portal import PortalDomainClient
+from src.domains.pricing import DomainQuote, is_ipv4, parse_domain_list
+from src.domains.setup import (
+    MAX_BULK,
+    quotes_over_limit,
+    run_confirmed_batch,
+    search_bulk,
+    search_specific,
+    select_for_purchase,
+)
+from src.workflow.intake import extract_app_command_payload, workflow_reply_kind
+from src.workflow.locks import user_lock
 from src.workflow.logging_setup import setup_logging
+from src.workflow.runner import (
+    cleanup_crm_temp,
+    execute_next,
+    next_action,
+    precheck,
+    resolve_domain,
+)
 from src.workflow.persist import (
     WorkflowStore,
     app_key_from_parsed,
@@ -56,8 +79,6 @@ from src.workflow.persist import (
 from src.workflow.steps import (
     STEP_LABELS,
     WorkflowStep,
-    goto_callback,
-    next_step,
     parse_callback,
 )
 
@@ -72,7 +93,10 @@ CRM_THEME_CALLBACK_PREFIX = "wf:theme:"
 DOMAIN_CONFIRM_CALLBACK = "wf:domain:confirm"
 RESUME_CONTINUE_CALLBACK = "wf:resume:continue"
 RESUME_RESTART_CALLBACK = "wf:resume:restart"
+RETRY_CALLBACK = "wf:retry"
 PENDING_RESUME_KEY = "pending_resume"
+DOMAIN_JOB_KEY = "domain_job"
+DOMAIN_APP_KEY = "domain-purchase"
 
 CRM_STATUS_ACTIVE = 2
 
@@ -80,9 +104,19 @@ _workflow_store = WorkflowStore()
 
 START_TEXT = (
     "👋 <b>Бот завода приложений</b>\n\n"
-    "Перешлите или отправьте сообщение о новом приложении.\n\n"
-    "Работа идёт по шагам — на каждом этапе нужно подтвердить переход кнопкой.\n\n"
-    "Поддерживаются форматы iOS 🍏 и Android 🤖"
+    "Завод начинается только командой <code>/app</code>.\n\n"
+    "Можно сразу:\n"
+    "<code>/app\nНовое IOS приложение\n...</code>\n\n"
+    "Или <code>/app</code> без текста — бот подождёт следующее сообщение с данными.\n\n"
+    "Дальше шаги идут сами. Архив, тематику, домен и ключи Facebook "
+    "бот попросит отдельно, их можно присылать обычным сообщением.\n\n"
+    "Просто пересланный текст без <code>/app</code> завод не запускает.\n\n"
+    "Покупка домена: <code>/domain</code> (Dynadot, Cloudflare, CRM)."
+)
+
+APP_WAIT_TEXT = (
+    "Пришлите сообщение о приложении следующим сообщением.\n"
+    "Можно переслать его как есть."
 )
 
 
@@ -282,7 +316,10 @@ async def _apply_resumed_workflow(
         return
 
     if wf.get("awaiting_domain"):
-        await _start_domain_step(update, context, wf)
+        await message.reply_text(
+            "Продолжаем шаг домена. Пришлите домен текстом, например <code>example.sbs</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if wf.get("crm_needs_recollect"):
@@ -302,8 +339,8 @@ async def _apply_resumed_workflow(
     await message.reply_text(
         f"♻️ Продолжаем завод.\nСледующий шаг: <b>{escape(label)}</b>",
         parse_mode=ParseMode.HTML,
-        reply_markup=_step_keyboard(step),
     )
+    await _run_pipeline(update, context, wf)
 
 
 def _log_user_action(update_or_message: Update | Any, action: str, **extra: Any) -> None:
@@ -324,23 +361,9 @@ def _log_user_action(update_or_message: Update | Any, action: str, **extra: Any)
     )
 
 
-def _step_keyboard(step: WorkflowStep) -> InlineKeyboardMarkup:
-    label = STEP_LABELS.get(step, step.value)
-    step_number = list(WorkflowStep).index(step) + 1
+def _retry_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"▶️ Шаг {step_number}: {label}", callback_data=goto_callback(step))]]
-    )
-
-
-def _crm_create_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✅ Создать приложение в CRM", callback_data=CRM_CREATE_CALLBACK)]]
-    )
-
-
-def _domain_confirm_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✅ Добавить домен на бэк", callback_data=DOMAIN_CONFIRM_CALLBACK)]]
+        [[InlineKeyboardButton("🔁 Повторить шаг", callback_data=RETRY_CALLBACK)]]
     )
 
 
@@ -362,10 +385,6 @@ def _theme_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _has_next_step(step: WorkflowStep) -> bool:
-    return next_step(step) is not None
-
-
 def _needs_apns(parsed: ParsedApp) -> bool:
     if not parsed.pushes:
         return False
@@ -385,16 +404,173 @@ def _crm_files_state(wf: dict[str, Any]) -> dict[str, Any]:
     return wf.setdefault("crm_files", {})
 
 
-async def _notify_error(message, text: str) -> None:
+async def _notify_error(message, text: str, *, retry: bool = False) -> None:
     await message.reply_text(
         f"❌ <b>Ошибка</b>\n\n{escape(text)}",
         parse_mode=ParseMode.HTML,
+        reply_markup=_retry_keyboard() if retry else None,
     )
+
+
+def _html_lines(text: str) -> str:
+    return "\n".join(escape(line) for line in (text or "").splitlines()) or "—"
+
+
+def _action_label(action: str) -> str:
+    mapping = {
+        "binom": STEP_LABELS[WorkflowStep.BINOM],
+        "crm": STEP_LABELS[WorkflowStep.CRM],
+        "crm_create": STEP_LABELS[WorkflowStep.CRM],
+        "crm_grant": "Доступ к приложению в CRM",
+        "domain": STEP_LABELS[WorkflowStep.DOMAIN],
+        "backend": STEP_LABELS[WorkflowStep.BACKEND],
+    }
+    return mapping.get(action, action)
+
+
+def _template_for_wf(wf: dict[str, Any]) -> int:
+    parsed = _parsed_from_dict(wf["parsed"])
+    return _get_template_campaign_id(parsed.platform)
+
+
+async def _run_locked(update: Update, action) -> None:
+    lock = user_lock(_user_id(update))
+    if lock.locked():
+        if update.callback_query:
+            await update.callback_query.answer("Уже выполняется")
+        message = update.effective_message
+        if message:
+            await message.reply_text("Предыдущий запуск ещё идёт, подождите.")
+        return
+    async with lock:
+        await action()
+
+
+async def _run_pipeline(update: Update, context: ContextTypes.DEFAULT_TYPE, wf: dict[str, Any]) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
+    resolve_domain(wf)
+    try:
+        notes = await asyncio.to_thread(precheck, wf, _get_binom_client(), _get_crm_client())
+    except Exception as exc:
+        logger.exception("precheck failed")
+        from src.binom import BinomError
+        from src.crm import CrmError
+
+        if not isinstance(exc, (BinomError, CrmError)):
+            raise
+        action = next_action(wf)
+        step = WorkflowStep.BINOM if action == "binom" else WorkflowStep.CRM
+        wf["failed_step"] = step.value
+        wf["failed_error"] = str(exc)
+        _persist_wf(update, context)
+        await _notify_error(message, str(exc), retry=True)
+        return
+
+    for note in notes:
+        await message.reply_text(f"ℹ️ {escape(note)}", parse_mode=ParseMode.HTML)
+    _persist_wf(update, context)
+
+    while True:
+        action = next_action(wf)
+        if action == "need_crm_files":
+            await _begin_crm_collection(message, context, wf)
+            return
+        if action == "need_domain":
+            wf["awaiting_domain"] = True
+            _persist_wf(update, context)
+            crm = wf.get("crm") or {}
+            await message.reply_text(
+                f"<b>{STEP_LABELS[WorkflowStep.DOMAIN]}</b>\n\n"
+                f"ID CRM: <code>{escape(str(crm.get('id', '—')))}</code>\n\n"
+                "В исходном сообщении домена нет. Пришлите его текстом, например "
+                "<code>example.sbs</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if action == "need_android_fb":
+            parsed = _parsed_from_dict(wf["parsed"])
+            await _start_android_backend_step(update, context, wf, parsed)
+            return
+        if action == "backend_unsupported":
+            await message.reply_text(
+                f"<b>{STEP_LABELS[WorkflowStep.BACKEND]}</b>\n\n"
+                "Старый бэкенд пока не автоматизирован.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if action in {"need_missing", "need_parse", "done"}:
+            if action == "done":
+                cleanup_crm_temp(wf)
+                _delete_persisted_wf(update, wf)
+                await message.reply_text("✅ <b>Готово.</b> Все шаги выполнены.", parse_mode=ParseMode.HTML)
+            return
+
+        label = _action_label(action)
+        status = await message.reply_text(f"⏳ <b>{escape(label)}</b>", parse_mode=ParseMode.HTML)
+        result = await asyncio.to_thread(
+            execute_next,
+            wf,
+            binom=_get_binom_client(),
+            crm=_get_crm_client(),
+            new_backend=_get_new_backend_client(),
+            android_backend=_get_android_backend_client(),
+            template_id=_template_for_wf(wf),
+            team_ids=_get_crm_team_ids(),
+            organic_link=_resolve_binom_url(wf),
+            persist=lambda: _persist_wf(update, context),
+        )
+        _persist_wf(update, context)
+        if not result.ok:
+            if result.action == "need_domain":
+                wf["awaiting_domain"] = True
+                _persist_wf(update, context)
+                await status.edit_text(
+                    "Пришлите домен текстом, например <code>example.sbs</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            await status.edit_text(
+                f"❌ <b>{escape(label)}</b>\n\n{escape(result.error)}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_retry_keyboard(),
+            )
+            return
+
+        title = "Пропущено" if result.skipped else "Готово"
+        await status.edit_text(
+            f"✅ <b>{escape(label)}</b> — {title}\n{_html_lines(result.summary)}",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _log_user_action(update, "start")
     await update.message.reply_text(START_TEXT, parse_mode=ParseMode.HTML)
+
+
+async def app_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Старт завода: /app с текстом сразу или /app и данные следующим сообщением."""
+
+    async def _body() -> None:
+        message = update.message
+        if not message:
+            return
+
+        payload = extract_app_command_payload(message.text or message.caption or "")
+        _log_user_action(update, "app_command", has_payload=bool(payload))
+        if not payload:
+            wf = _workflow(context)
+            wf.clear()
+            wf["awaiting_app"] = True
+            await message.reply_text(APP_WAIT_TEXT, parse_mode=ParseMode.HTML)
+            return
+
+        await _ingest_app_text(update, context, payload)
+
+    await _run_locked(update, _body)
 
 
 async def step2_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -511,7 +687,7 @@ async def back_android_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "Пример:\n"
             "<code>/back_android\n"
             "com.skyforgenomads.sky\n"
-            "url=https://grand4clickz.com/c5wzl6k.php?key=20aem9pgxubiwwlv8nay</code>",
+            "url=https://tracker.example/click.php?key=campaignkey</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -618,36 +794,75 @@ async def back_android_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _body() -> None:
+        await _handle_message_body(update, context)
+
+    await _run_locked(update, _body)
+
+
+async def _handle_message_body(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not message:
         return
 
     wf = _workflow(context)
-    if wf.get("crm_collecting"):
+    kind = workflow_reply_kind(wf)
+
+    if kind == "crm":
         await _handle_crm_file_message(update, context, wf)
         return
 
     text = message.text or message.caption
-    if wf.get("awaiting_android_fb"):
+    if kind == "android_fb":
         if not text:
             await message.reply_text("Пришлите настройки Facebook текстом.")
             return
         await _handle_android_fb_reply(update, context, wf, text)
         return
 
-    if not text:
-        await message.reply_text("Отправьте текстовое сообщение с данными о приложении.")
-        return
-
-    if wf.get("awaiting_domain"):
+    if kind == "domain":
+        if not text:
+            await message.reply_text("Пришлите домен текстом.")
+            return
         await _handle_domain_reply(update, context, wf, text)
         return
 
-    if wf.get("awaiting_missing") and wf.get("parsed"):
+    if kind == "missing":
+        if not text:
+            await message.reply_text("Пришлите недостающие данные текстом.")
+            return
         await _handle_missing_reply(update, context, wf, text)
         return
 
+    if kind == "app":
+        if not text:
+            await message.reply_text(APP_WAIT_TEXT, parse_mode=ParseMode.HTML)
+            return
+        wf.pop("awaiting_app", None)
+        await _ingest_app_text(update, context, text)
+        return
+
+    if await _domain_job_wants_text(update, context):
+        return
+
+    await message.reply_text(
+        "Завод начинается с команды <code>/app</code>.\n"
+        "Пересланное сообщение само по себе ничего не запускает.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _ingest_app_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+
     parsed = parse_app_message(text)
+    wf = _workflow(context)
     app_key = app_key_from_parsed(parsed)
     if app_key:
         resumable = _find_resumable_state(update, context, app_key)
@@ -690,10 +905,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await message.reply_text(format_missing_prompt(parsed), parse_mode=ParseMode.HTML)
         return
 
-    reply += "\n\n✅ <b>Шаг 1 выполнен.</b> Данные распознаны."
-    markup = _step_keyboard(WorkflowStep.BINOM) if _has_next_step(WorkflowStep.PARSE) else None
+    reply += "\n\n✅ <b>Шаг 1 выполнен.</b> Данные распознаны. Запускаю следующие шаги."
+    resolve_domain(wf)
     _persist_wf(update, context)
-    await message.reply_text(reply, parse_mode=ParseMode.HTML, reply_markup=markup)
+    await message.reply_text(reply, parse_mode=ParseMode.HTML)
+    await _run_pipeline(update, context, wf)
 
 
 async def _handle_missing_reply(
@@ -734,15 +950,22 @@ async def _handle_missing_reply(
         await _begin_crm_collection(message, context, wf)
         return
 
-    markup = _step_keyboard(WorkflowStep.BINOM) if _has_next_step(WorkflowStep.PARSE) else None
     await message.reply_text(
-        "✅ <b>Шаг 1 выполнен.</b> Данные распознаны.",
+        "✅ <b>Шаг 1 выполнен.</b> Данные распознаны. Запускаю следующие шаги.",
         parse_mode=ParseMode.HTML,
-        reply_markup=markup,
     )
+    resolve_domain(wf)
+    await _run_pipeline(update, context, wf)
 
 
 async def handle_step_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _body() -> None:
+        await _handle_step_callback_body(update, context)
+
+    await _run_locked(update, _body)
+
+
+async def _handle_step_callback_body(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.data:
         return
@@ -774,6 +997,7 @@ async def handle_step_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.message.reply_text("Пришлите сообщение о приложении ещё раз.")
             return
         wf = _workflow(context)
+        cleanup_crm_temp(wf)
         wf.clear()
         parsed = _parsed_from_dict(fresh)
         wf["parsed"] = parsed.to_dict()
@@ -786,7 +1010,6 @@ async def handle_step_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             f"{format_parsed_app(parsed)}\n\n"
             "✅ <b>Шаг 1 выполнен.</b> Данные распознаны. Начинаем заново."
         )
-        markup = None
         if not is_parse_complete(parsed):
             wf["awaiting_missing"] = True
             wf["awaiting_after"] = "binom"
@@ -794,25 +1017,18 @@ async def handle_step_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.message.reply_text(reply, parse_mode=ParseMode.HTML)
             await query.message.reply_text(format_missing_prompt(parsed), parse_mode=ParseMode.HTML)
             return
-        markup = _step_keyboard(WorkflowStep.BINOM) if _has_next_step(WorkflowStep.PARSE) else None
+        resolve_domain(wf)
         _persist_wf(update, context)
-        await query.message.reply_text(reply, parse_mode=ParseMode.HTML, reply_markup=markup)
+        await query.message.reply_text(reply, parse_mode=ParseMode.HTML)
+        await _run_pipeline(update, context, wf)
         return
 
-    if query.data == CRM_CREATE_CALLBACK:
+    if query.data in {CRM_CREATE_CALLBACK, DOMAIN_CONFIRM_CALLBACK, RETRY_CALLBACK}:
         await query.answer()
         await query.edit_message_reply_markup(reply_markup=None)
         wf = _workflow(context)
-        _log_user_action(update, "step_crm_create_requested")
-        await _run_crm_create(update, context, wf)
-        return
-
-    if query.data == DOMAIN_CONFIRM_CALLBACK:
-        await query.answer()
-        await query.edit_message_reply_markup(reply_markup=None)
-        wf = _workflow(context)
-        _log_user_action(update, "step_domain_confirm")
-        await _run_domain_step(update, context, wf)
+        _log_user_action(update, "step_retry" if query.data == RETRY_CALLBACK else "step_legacy_button")
+        await _run_pipeline(update, context, wf)
         return
 
     if query.data.startswith(CRM_THEME_CALLBACK_PREFIX):
@@ -826,98 +1042,9 @@ async def handle_step_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await query.answer()
     await query.edit_message_reply_markup(reply_markup=None)
-
     wf = _workflow(context)
     _log_user_action(update, "step_requested", step=step.value)
-
-    if step == WorkflowStep.BINOM:
-        await _run_binom_step(update, context, wf)
-        return
-
-    if step == WorkflowStep.CRM:
-        await _start_crm_collection(update, context, wf)
-        return
-
-    if step == WorkflowStep.DOMAIN:
-        await _start_domain_step(update, context, wf)
-        return
-
-    if step == WorkflowStep.BACKEND:
-        await _run_backend_step(update, context, wf)
-        return
-
-    await query.message.reply_text(f"Шаг «{STEP_LABELS.get(step, step.value)}» ещё не настроен.")
-
-
-async def _run_binom_step(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    wf: dict[str, Any],
-) -> None:
-    message = update.callback_query.message
-
-    parsed_data = wf.get("parsed")
-    if not parsed_data:
-        await message.reply_text("Нет данных приложения. Сначала отправьте сообщение о приложении.")
-        return
-
-    parsed = _parsed_from_dict(parsed_data)
-    if parsed.platform == Platform.UNKNOWN or parsed.missing_fields:
-        await message.reply_text("Нельзя создать кампанию: не хватает данных в сообщении.")
-        return
-
-    client = _get_binom_client()
-    if client is None:
-        await message.reply_text("Binom API не настроен. Добавьте BINOM_API_URL и BINOM_API_KEY в .env")
-        return
-
-    campaign_name = format_campaign_name(parsed)
-    template_id = _get_template_campaign_id(parsed.platform)
-
-    await message.reply_text(
-        f"⏳ <b>Шаг 2 — {STEP_LABELS[WorkflowStep.BINOM]}</b>\n"
-        f"Шаблон: #{template_id}\n"
-        f"Название: <b>{escape(campaign_name)}</b>",
-        parse_mode=ParseMode.HTML,
-    )
-
-    try:
-        cloned = client.clone_campaign(campaign_name, template_id=template_id)
-    except BinomError as exc:
-        logger.exception("Binom clone failed for user")
-        _log_user_action(update, "step_binom_failed", error=str(exc))
-        await _notify_error(message, f"Binom: {exc}")
-        return
-
-    wf["binom"] = {"id": cloned.id, "name": cloned.name, "url": cloned.url, "key": cloned.key}
-    completed = wf.setdefault("completed_steps", [])
-    if WorkflowStep.BINOM.value not in completed:
-        completed.append(WorkflowStep.BINOM.value)
-    _persist_wf(update, context)
-
-    _log_user_action(
-        update,
-        "step_binom_done",
-        campaign_id=cloned.id,
-        campaign_name=cloned.name,
-        template_id=template_id,
-    )
-
-    reply = (
-        f"<b>Шаг 2 — {STEP_LABELS[WorkflowStep.BINOM]}</b>\n\n"
-        f"<b>Название:</b> {escape(cloned.name)}\n"
-        f"<b>ID:</b> {cloned.id}\n"
-        f"<b>Key:</b> <code>{escape(cloned.key or '—')}</code>\n"
-        f'<b>Ссылка:</b> <a href="{escape(cloned.url)}">{escape(cloned.url or "—")}</a>\n\n'
-        "✅ <b>Шаг 2 выполнен.</b> Кампания создана в Binom."
-    )
-
-    markup = None
-    next_st = next_step(WorkflowStep.BINOM)
-    if next_st is not None:
-        markup = _step_keyboard(next_st)
-
-    await message.reply_text(reply, parse_mode=ParseMode.HTML, reply_markup=markup)
+    await _run_pipeline(update, context, wf)
 
 
 async def _start_crm_collection(
@@ -1035,7 +1162,7 @@ async def _process_crm_zip(
         await _notify_error(message, "Отправьте ZIP-архив с картинками как документ.")
         return
 
-    filename = document.file_name or "assets.zip"
+    filename = safe_zip_filename(document.file_name)
     if not filename.lower().endswith(".zip"):
         await _notify_error(message, "Нужен ZIP-архив (.zip) с картинками.")
         return
@@ -1080,7 +1207,7 @@ async def _process_crm_apns(
         await _notify_error(message, "Отправьте APNS JSON-файл как документ.")
         return
 
-    filename = document.file_name or "apns.json"
+    filename = safe_upload_filename(document.file_name, "apns.json")
     target = temp_dir / filename
     telegram_file = await context.bot.get_file(document.file_id)
     await telegram_file.download_to_drive(custom_path=str(target))
@@ -1140,174 +1267,15 @@ async def _handle_theme_selected(
     await query.edit_message_reply_markup(reply_markup=None)
     await message.reply_text(
         f"✅ Тематика выбрана: <b>{escape(theme_name)}</b> "
-        f"(theme_id=<code>{theme_id}</code>)\n\n"
-        "Нажмите кнопку для создания приложения в CRM.",
+        f"(theme_id=<code>{theme_id}</code>)",
         parse_mode=ParseMode.HTML,
-        reply_markup=_crm_create_keyboard(),
     )
+    await _run_pipeline(update, context, wf)
 
 
 async def _mark_crm_ready(message, wf: dict[str, Any]) -> None:
     # Kept for compatibility; theme selection is required before create.
     await _ask_crm_theme(message, wf)
-
-async def _run_crm_create(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    wf: dict[str, Any],
-) -> None:
-    message = update.callback_query.message
-
-    if not wf.get("crm_ready"):
-        await message.reply_text("Сначала отправьте файлы и выберите тематику.")
-        return
-
-    theme_id = wf.get("crm_theme_id")
-    theme_name = wf.get("crm_theme_name")
-    if not theme_id:
-        await message.reply_text("Сначала выберите тематику.")
-        await _ask_crm_theme(message, wf)
-        return
-
-    parsed = _parsed_from_dict(wf["parsed"])
-    files = _crm_files_state(wf)
-    client = _get_crm_client()
-    if client is None:
-        await _notify_error(message, "CRM API не настроен.")
-        return
-
-    team_ids = _get_crm_team_ids()
-
-    try:
-        created_by = resolve_apps_created_by(parsed.owner)
-        payload = build_create_app_payload(
-            parsed,
-            logo=files.get("logo"),
-            banner=files.get("banner"),
-            banner_appcraft=files.get("banner_appcraft"),
-            slider=files.get("slider"),
-            apns_key=files.get("apns"),
-            apps_status=CRM_STATUS_ACTIVE,
-            apps_created_by=created_by,
-            theme_id=theme_id,
-            is_private=True,
-        )
-    except ValueError as exc:
-        await _notify_error(message, str(exc))
-        return
-
-    await message.reply_text(
-        f"⏳ <b>Шаг 3 — {STEP_LABELS[WorkflowStep.CRM]}</b>\n"
-        f"Создаю приложение <b>{escape(parsed.name or '')}</b>...\n"
-        f"Тематика: <b>{escape(str(theme_name))}</b> (<code>{theme_id}</code>)\n"
-        f"Разработка команды: <code>{escape(created_by)}</code>",
-        parse_mode=ParseMode.HTML,
-    )
-
-    try:
-        created = client.create_app(payload)
-    except CrmError as exc:
-        logger.exception("CRM create failed for user")
-        _log_user_action(update, "step_crm_failed", error=str(exc))
-        await _notify_error(message, f"CRM (создание): {exc}")
-        return
-
-    try:
-        client.grant_app_access(created.id, team_ids=team_ids, user_ids=[])
-    except CrmError as exc:
-        logger.exception("CRM grant access failed for user")
-        _log_user_action(update, "step_crm_access_failed", app_id=created.id, error=str(exc))
-        await _notify_error(
-            message,
-            f"Приложение создано (ID {created.id}), но не удалось выдать доступ командам "
-            f"{', '.join(str(t) for t in team_ids)}:\n{exc}",
-        )
-        return
-
-    wf["crm"] = {"id": created.id, "name": created.name}
-    completed = wf.setdefault("completed_steps", [])
-    if WorkflowStep.CRM.value not in completed:
-        completed.append(WorkflowStep.CRM.value)
-
-    wf["crm_collecting"] = False
-    wf.pop("crm_ready", None)
-    _persist_wf(update, context)
-
-    _log_user_action(
-        update,
-        "step_crm_done",
-        app_id=created.id,
-        app_name=created.name,
-        teams=team_ids,
-        theme_id=theme_id,
-    )
-
-    reply = (
-        f"<b>Шаг 3 — {STEP_LABELS[WorkflowStep.CRM]}</b>\n\n"
-        f"<b>Название:</b> {escape(created.name)}\n"
-        f"<b>ID:</b> {created.id}\n"
-        f"<b>Тематика:</b> {escape(str(theme_name))} (<code>{theme_id}</code>)\n"
-        f"<b>Статус:</b> Активен\n"
-        f"<b>Разработка команды:</b> {escape(created_by)}\n"
-        f"<b>Команды:</b> {escape(', '.join(str(t) for t in team_ids))}\n\n"
-        "✅ <b>Шаг 3 выполнен.</b> Приложение создано в CRM."
-    )
-
-    markup = None
-    next_st = next_step(WorkflowStep.CRM)
-    if next_st is not None:
-        markup = _step_keyboard(next_st)
-
-    await message.reply_text(reply, parse_mode=ParseMode.HTML, reply_markup=markup)
-
-
-async def _start_domain_step(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    wf: dict[str, Any],
-) -> None:
-    message = update.callback_query.message if update.callback_query else update.message
-    if not message:
-        return
-
-    crm = wf.get("crm") or {}
-    app_id = crm.get("id")
-    if not app_id:
-        await message.reply_text("Нет ID приложения из CRM. Сначала выполните шаг 3.")
-        return
-
-    parsed = _parsed_from_dict(wf["parsed"]) if wf.get("parsed") else None
-    app_name = crm.get("name") or (parsed.name if parsed else "—")
-    domain = normalize_backend_domain(
-        wf.get("domain") or (parsed.backend_domain if parsed else None)
-    )
-
-    if domain:
-        wf["domain"] = domain
-        wf.pop("awaiting_domain", None)
-        _persist_wf(update, context)
-        await message.reply_text(
-            f"<b>Шаг 4 — {STEP_LABELS[WorkflowStep.DOMAIN]}</b>\n\n"
-            f"<b>Приложение:</b> {escape(str(app_name))}\n"
-            f"<b>ID CRM:</b> {app_id}\n"
-            f"<b>Домен:</b> <code>{escape(domain)}</code>\n\n"
-            "Проверьте данные и нажмите кнопку для добавления домена на бэк.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=_domain_confirm_keyboard(),
-        )
-        return
-
-    wf["awaiting_domain"] = True
-    _persist_wf(update, context)
-    await message.reply_text(
-        f"<b>Шаг 4 — {STEP_LABELS[WorkflowStep.DOMAIN]}</b>\n\n"
-        f"<b>Приложение:</b> {escape(str(app_name))}\n"
-        f"<b>ID CRM:</b> {app_id}\n\n"
-        "⚠️ Домен не найден в исходном сообщении.\n"
-        "Пришлите домен текстом, например: <code>example.sbs</code>",
-        parse_mode=ParseMode.HTML,
-    )
-
 
 async def _handle_domain_reply(
     update: Update,
@@ -1326,97 +1294,19 @@ async def _handle_domain_reply(
 
     wf["domain"] = domain
     wf.pop("awaiting_domain", None)
-
-    crm = wf.get("crm") or {}
-    parsed = _parsed_from_dict(wf["parsed"]) if wf.get("parsed") else None
-    app_name = crm.get("name") or (parsed.name if parsed else "—")
-    app_id = crm.get("id", "—")
-
-    # Keep parsed backend_domain in sync for later steps.
     if isinstance(wf.get("parsed"), dict):
         wf["parsed"]["backend_domain"] = domain
 
-    _log_user_action(update, "domain_received", domain=domain, app_id=app_id)
+    crm = wf.get("crm") or {}
+    _log_user_action(update, "domain_received", domain=domain, app_id=crm.get("id"))
     _persist_wf(update, context)
 
     await message.reply_text(
-        f"<b>Шаг 4 — {STEP_LABELS[WorkflowStep.DOMAIN]}</b>\n\n"
-        f"<b>Приложение:</b> {escape(str(app_name))}\n"
-        f"<b>ID CRM:</b> {app_id}\n"
-        f"<b>Домен:</b> <code>{escape(domain)}</code>\n\n"
-        "Проверьте данные и нажмите кнопку для добавления домена на бэк.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=_domain_confirm_keyboard(),
-    )
-
-
-async def _run_domain_step(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    wf: dict[str, Any],
-) -> None:
-    message = update.callback_query.message
-
-    crm = wf.get("crm") or {}
-    app_id = crm.get("id")
-    domain = normalize_backend_domain(wf.get("domain"))
-    if not app_id:
-        await _notify_error(message, "Нет ID приложения из CRM.")
-        return
-    if not domain:
-        wf["awaiting_domain"] = True
-        _persist_wf(update, context)
-        await message.reply_text(
-            "Домен не указан. Пришлите домен текстом, например: <code>example.sbs</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    client = _get_crm_client()
-    if client is None:
-        await _notify_error(message, "CRM API не настроен.")
-        return
-
-    parsed = _parsed_from_dict(wf["parsed"]) if wf.get("parsed") else None
-    app_name = crm.get("name") or (parsed.name if parsed else "—")
-
-    await message.reply_text(
-        f"⏳ <b>Шаг 4 — {STEP_LABELS[WorkflowStep.DOMAIN]}</b>\n"
-        f"Приложение: <b>{escape(str(app_name))}</b> (ID {app_id})\n"
+        f"<b>{STEP_LABELS[WorkflowStep.DOMAIN]}</b>\n"
         f"Домен: <code>{escape(domain)}</code>",
         parse_mode=ParseMode.HTML,
     )
-
-    try:
-        client.set_app_domain(int(app_id), domain)
-    except CrmError as exc:
-        logger.exception("CRM set domain failed")
-        _log_user_action(update, "step_domain_failed", app_id=app_id, domain=domain, error=str(exc))
-        await _notify_error(message, f"CRM (домен): {exc}")
-        return
-
-    wf["domain_bound"] = {"apps_id": int(app_id), "domain": domain}
-    completed = wf.setdefault("completed_steps", [])
-    if WorkflowStep.DOMAIN.value not in completed:
-        completed.append(WorkflowStep.DOMAIN.value)
-
-    _log_user_action(update, "step_domain_done", app_id=app_id, domain=domain)
-    _persist_wf(update, context)
-
-    reply = (
-        f"<b>Шаг 4 — {STEP_LABELS[WorkflowStep.DOMAIN]}</b>\n\n"
-        f"<b>Приложение:</b> {escape(str(app_name))}\n"
-        f"<b>ID CRM:</b> {app_id}\n"
-        f"<b>Домен:</b> <code>{escape(domain)}</code>\n\n"
-        "✅ <b>Шаг 4 выполнен.</b> Домен добавлен на бэк."
-    )
-
-    markup = None
-    next_st = next_step(WorkflowStep.DOMAIN)
-    if next_st is not None:
-        markup = _step_keyboard(next_st)
-
-    await message.reply_text(reply, parse_mode=ParseMode.HTML, reply_markup=markup)
+    await _run_pipeline(update, context, wf)
 
 
 def _get_new_backend_client() -> NewBackendClient | None:
@@ -1431,128 +1321,6 @@ def _get_new_backend_client() -> NewBackendClient | None:
 def _resolve_binom_key(wf: dict[str, Any]) -> str:
     binom = wf.get("binom") or {}
     return extract_binom_campaign_key(key=binom.get("key"), url=binom.get("url"))
-
-
-async def _run_backend_step(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    wf: dict[str, Any],
-) -> None:
-    message = update.callback_query.message
-    parsed_data = wf.get("parsed")
-    if not parsed_data:
-        await message.reply_text("Нет данных приложения.")
-        return
-
-    parsed = _parsed_from_dict(parsed_data)
-    backend_type = (parsed.backend or "").strip().lower() if parsed.backend else ""
-
-    if parsed.platform == Platform.ANDROID:
-        await _start_android_backend_step(update, context, wf, parsed)
-        return
-
-    if backend_type == "старый":
-        await message.reply_text(
-            f"<b>Шаг 5 — {STEP_LABELS[WorkflowStep.BACKEND]}</b>\n\n"
-            "Старый бэкенд пока не автоматизирован. Сначала делаем новый iOS-бэк.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    if backend_type and backend_type != "новый":
-        await _notify_error(message, f"Неизвестный тип Backend: {parsed.backend}")
-        return
-
-    # Default / «Новый»
-    await _run_new_backend_step(update, context, wf, parsed)
-
-
-async def _run_new_backend_step(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    wf: dict[str, Any],
-    parsed: ParsedApp,
-) -> None:
-    message = update.callback_query.message
-    client = _get_new_backend_client()
-    if client is None:
-        await _notify_error(
-            message,
-            "Новый бэкенд не настроен. Добавьте BACKEND_NEW_USER и BACKEND_NEW_PASSWORD в .env",
-        )
-        return
-
-    binom_key = _resolve_binom_key(wf)
-    if not binom_key or binom_key.lower() == "dev":
-        await _notify_error(
-            message,
-            "Нет ключа кампании Binom. Сначала выполните шаг 2 (создание кампании) "
-            "или укажите key в workflow.",
-        )
-        return
-
-    domain = normalize_backend_domain(
-        wf.get("domain") or parsed.backend_domain
-    )
-
-    await message.reply_text(
-        f"⏳ <b>Шаг 5 — {STEP_LABELS[WorkflowStep.BACKEND]}</b>\n"
-        "Новый бэкенд: ищу приложение и сохраняю настройки...\n"
-        f"Name: <b>{escape(parsed.name or '—')}</b>\n"
-        f"Domain: <code>{escape(domain or '—')}</code>\n"
-        f"Store ID: <code>{escape(parsed.store_id or '—')}</code>\n"
-        f"Binom key: <code>{escape(binom_key)}</code>",
-        parse_mode=ParseMode.HTML,
-    )
-
-    try:
-        app = client.find_app(name=parsed.name, domain=domain, store_id=parsed.store_id)
-        client.configure_app(app.id, binom_key=binom_key)
-    except NewBackendError as exc:
-        logger.exception("New backend configure failed")
-        _log_user_action(update, "step_backend_failed", error=str(exc))
-        await _notify_error(message, f"Новый бэкенд: {exc}")
-        return
-
-    wf["backend"] = {
-        "type": "new",
-        "panel_id": app.id,
-        "app_id": app.app_id,
-        "domain": app.domain,
-        "name": app.name,
-        "edit_url": f"{os.getenv('BACKEND_NEW_URL', 'https://neonflightgold777.cfd').rstrip('/')}/apps/{app.id}/edit",
-    }
-    completed = wf.setdefault("completed_steps", [])
-    if WorkflowStep.BACKEND.value not in completed:
-        completed.append(WorkflowStep.BACKEND.value)
-
-    _log_user_action(
-        update,
-        "step_backend_done",
-        panel_id=app.id,
-        domain=app.domain,
-        name=app.name,
-        binom_key=binom_key,
-    )
-    _delete_persisted_wf(update, wf)
-
-    edit_url = wf["backend"]["edit_url"]
-    reply = (
-        f"<b>Шаг 5 — {STEP_LABELS[WorkflowStep.BACKEND]}</b>\n\n"
-        f"<b>Панель ID:</b> {app.id}\n"
-        f"<b>Name:</b> {escape(app.name)}\n"
-        f"<b>Domain:</b> <code>{escape(app.domain)}</code>\n"
-        f"<b>Binom key:</b> <code>{escape(binom_key)}</code>\n"
-        f'<b>Edit:</b> <a href="{escape(edit_url)}">{escape(edit_url)}</a>\n\n'
-        "✅ <b>Шаг 5 выполнен.</b> Новый бэкенд настроен."
-    )
-
-    markup = None
-    next_st = next_step(WorkflowStep.BACKEND)
-    if next_st is not None:
-        markup = _step_keyboard(next_st)
-
-    await message.reply_text(reply, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
 def _get_android_backend_client() -> AndroidBackendClient | None:
@@ -1583,7 +1351,9 @@ async def _start_android_backend_step(
     wf: dict[str, Any],
     parsed: ParsedApp,
 ) -> None:
-    message = update.callback_query.message if update.callback_query else update.message
+    message = update.effective_message
+    if message is None:
+        return
     client = _get_android_backend_client()
     if client is None:
         await _notify_error(
@@ -1670,82 +1440,466 @@ async def _handle_android_fb_reply(
     wf.pop("android_fb_next", None)
     _log_user_action(update, "android_fb_received", app_id=collected["app_id"])
     _persist_wf(update, context)
-    await _run_android_backend_step(update, context, wf)
+    await _run_pipeline(update, context, wf)
 
 
-async def _run_android_backend_step(
+class AllowedCallbackQueryHandler(CallbackQueryHandler):
+    """CallbackQueryHandler не принимает filters, поэтому режем тем же filters.User."""
+
+    def __init__(self, callback, user_filter: filters.User, pattern: str | None = None) -> None:
+        super().__init__(callback, pattern=pattern)
+        self.user_filter = user_filter
+
+    def check_update(self, update: object):
+        matched = super().check_update(update)
+        if not matched:
+            return None
+        user = update.effective_user if isinstance(update, Update) else None
+        if user is None or user.id not in self.user_filter.user_ids:
+            return None
+        return matched
+
+
+def _domain_max_price() -> float:
+    raw = os.getenv("DOMAIN_MAX_PRICE_USD", "3").strip() or "3"
+    try:
+        return float(raw)
+    except ValueError:
+        return 3.0
+
+
+def _domain_default_ip() -> str:
+    return os.getenv("DOMAIN_DEFAULT_IP", "5.75.214.90").strip() or "5.75.214.90"
+
+
+def _load_domain_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> dict[str, Any] | None:
+    current = context.user_data.get(DOMAIN_JOB_KEY)
+    if isinstance(current, dict):
+        return current
+    saved = _workflow_store.load(_user_id(update), DOMAIN_APP_KEY)
+    if saved and isinstance(saved.get("domain_job"), dict):
+        context.user_data[DOMAIN_JOB_KEY] = saved["domain_job"]
+        return saved["domain_job"]
+    return None
+
+
+def _save_domain_job(update: Update, context: ContextTypes.DEFAULT_TYPE, job: dict[str, Any]) -> None:
+    context.user_data[DOMAIN_JOB_KEY] = job
+    try:
+        _workflow_store.save(_user_id(update), {"app_key": DOMAIN_APP_KEY, "domain_job": job})
+    except OSError:
+        logger.exception("Не удалось сохранить покупку домена")
+
+
+def _quote_rows(quotes: list[DomainQuote]) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": quote.name,
+            "available": quote.available,
+            "price": quote.price_usd,
+            "price_text": quote.price_text,
+        }
+        for quote in quotes
+    ]
+
+
+def _rows_to_quotes(rows: list[dict[str, Any]]) -> list[DomainQuote]:
+    return [
+        DomainQuote(
+            name=str(row.get("name") or ""),
+            available=bool(row.get("available")),
+            price_usd=row.get("price"),
+            price_text=str(row.get("price_text") or ""),
+        )
+        for row in rows
+    ]
+
+
+def _domain_states_from_quotes(quotes: list[DomainQuote]) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": quote.name,
+            "price": quote.price_usd,
+            "done": [],
+            "failed_step": None,
+            "error": None,
+            "bought": False,
+        }
+        for quote in quotes
+    ]
+
+
+def _format_quote_list(quotes: list[DomainQuote], *, limit: float) -> str:
+    lines = []
+    total = 0.0
+    for quote in quotes:
+        price = "нет цены" if quote.price_usd is None else f"${quote.price_usd:.2f}"
+        mark = ""
+        if quote.price_usd is not None and quote.price_usd > limit:
+            mark = " — выше лимита"
+        if not quote.available:
+            mark = " — занят"
+        lines.append(f"• <code>{escape(quote.name)}</code> — {price}{mark}")
+        if quote.available and quote.price_usd is not None:
+            total += quote.price_usd
+    lines.append(f"\nИтого к покупке: <b>${total:.2f}</b>")
+    return "\n".join(lines)
+
+
+async def domain_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _body() -> None:
+        message = update.message
+        if not message:
+            return
+        if not os.getenv("DYNADOT_API_KEY"):
+            await message.reply_text("Не задан DYNADOT_API_KEY.")
+            return
+        if _get_crm_client() is None:
+            await message.reply_text("CRM не настроена.")
+            return
+        existing = _load_domain_job(update, context)
+        if existing and existing.get("stage") not in (None, "done"):
+            await message.reply_text("Продолжаю незавершённую покупку доменов.")
+            await _prompt_domain_stage(update, context, existing)
+            return
+        job = {
+            "stage": "mode",
+            "max_price": _domain_max_price(),
+            "default_ip": _domain_default_ip(),
+            "confirmed": False,
+            "allow_over_limit": False,
+            "quotes": [],
+            "domains": [],
+            "ip": None,
+        }
+        _save_domain_job(update, context, job)
+        await message.reply_text(
+            "Покупка домена на Dynadot, затем Cloudflare и CRM.\n"
+            f"В пачке беру только .top/.sbs дешевле ${job['max_price']:.0f}.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Пачка случайных", callback_data="dom:mode:bulk")],
+                    [InlineKeyboardButton("Конкретные имена", callback_data="dom:mode:specific")],
+                ]
+            ),
+        )
+
+    await _run_locked(update, _body)
+
+
+async def _domain_job_wants_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    job = _load_domain_job(update, context)
+    if not job or job.get("stage") in (None, "done"):
+        return False
+    await _handle_domain_job_text(update, context, job)
+    return True
+
+
+async def _handle_domain_job_text(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    wf: dict[str, Any],
+    job: dict[str, Any],
 ) -> None:
-    message = update.message or (update.callback_query.message if update.callback_query else None)
-    parsed = _parsed_from_dict(wf["parsed"])
-    fb = wf.get("android_fb") or {}
-    client = _get_android_backend_client()
-    if client is None:
-        await _notify_error(message, "Android-бэкенд не настроен.")
+    message = update.message
+    if not message:
         return
-
-    organic_link = _resolve_binom_url(wf)
-    await message.reply_text(
-        f"⏳ <b>Шаг 5 — {STEP_LABELS[WorkflowStep.BACKEND]}</b>\n"
-        "Android-бэкенд: сохраняю настройки...\n"
-        f"Bundle: <code>{escape(parsed.bundle or '—')}</code>\n"
-        f"FB App ID: <code>{escape(fb.get('app_id', '—'))}</code>\n"
-        f"Organic: <code>{escape(organic_link)}</code>",
-        parse_mode=ParseMode.HTML,
-    )
-
-    try:
-        app = client.configure_app(
-            parsed.bundle or "",
-            fb_app_id=fb["app_id"],
-            fb_access_token=fb["access_token"],
-            fb_decryption_key=fb["decryption_key"],
-            organic_link=organic_link,
+    text = (message.text or message.caption or "").strip()
+    stage = job.get("stage")
+    if stage == "count":
+        if not text.isdigit() or not 1 <= int(text) <= MAX_BULK:
+            await message.reply_text(f"Нужно число от 1 до {MAX_BULK}.")
+            return
+        await message.reply_text("Ищу свободные имена и цены…")
+        try:
+            quotes, attempts = await asyncio.to_thread(
+                search_bulk,
+                DynadotClient(os.environ["DYNADOT_API_KEY"]),
+                int(text),
+                max_price=float(job["max_price"]),
+            )
+        except Exception as exc:
+            await message.reply_text(f"Поиск Dynadot: {exc}")
+            return
+        if len(quotes) < int(text):
+            await message.reply_text(
+                f"Нашёл {len(quotes)} из {text} (попыток: {attempts}). Можно купить то, что есть."
+            )
+        if not quotes:
+            job["stage"] = "done"
+            _save_domain_job(update, context, job)
+            await message.reply_text("Подходящих доменов не нашлось.")
+            return
+        job["quotes"] = _quote_rows(quotes)
+        job["stage"] = "ip"
+        _save_domain_job(update, context, job)
+        await _ask_domain_ip(message, job)
+        return
+    if stage == "names":
+        names = parse_domain_list(text)
+        if not names:
+            await message.reply_text("Не вижу доменных имён. Пришлите, например, backend42.top")
+            return
+        await message.reply_text("Проверяю доступность и цену…")
+        try:
+            quotes = await asyncio.to_thread(
+                search_specific,
+                DynadotClient(os.environ["DYNADOT_API_KEY"]),
+                " ".join(names),
+            )
+        except Exception as exc:
+            await message.reply_text(f"Поиск Dynadot: {exc}")
+            return
+        job["quotes"] = _quote_rows(quotes)
+        _save_domain_job(update, context, job)
+        await message.reply_text(
+            _format_quote_list(quotes, limit=float(job["max_price"])),
+            parse_mode=ParseMode.HTML,
         )
-    except AndroidBackendError as exc:
-        logger.exception("Android backend configure failed")
-        _log_user_action(update, "step_backend_failed", error=str(exc))
-        await _notify_error(message, f"Android-бэкенд: {exc}")
+        if quotes_over_limit(quotes, float(job["max_price"])):
+            job["stage"] = "over_limit"
+            _save_domain_job(update, context, job)
+            await message.reply_text(
+                f"Есть домены дороже ${float(job['max_price']):.0f}. Купить их тоже?",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("Да, включая дорогие", callback_data="dom:over:yes")],
+                        [InlineKeyboardButton("Только до лимита", callback_data="dom:over:no")],
+                    ]
+                ),
+            )
+            return
+        job["allow_over_limit"] = False
+        job["stage"] = "ip"
+        _save_domain_job(update, context, job)
+        await _ask_domain_ip(message, job)
         return
+    if stage == "ip":
+        if not is_ipv4(text):
+            await message.reply_text("Нужен IPv4, например 5.75.214.90")
+            return
+        job["ip"] = text.strip()
+        await _show_domain_confirm(message, job)
+        _save_domain_job(update, context, job)
+        return
+    await message.reply_text("Сейчас жду кнопку под предыдущим сообщением.")
 
-    wf["backend"] = {
-        "type": "android",
-        "panel_id": app.panel_id,
-        "bundle": app.bundle_name,
-        "site": app.site,
-        "edit_url": app.edit_url,
-        "organic_link": organic_link,
-    }
-    completed = wf.setdefault("completed_steps", [])
-    if WorkflowStep.BACKEND.value not in completed:
-        completed.append(WorkflowStep.BACKEND.value)
 
-    _log_user_action(
-        update,
-        "step_backend_done",
-        panel_id=app.panel_id,
-        bundle=app.bundle_name,
-        site=app.site,
+async def _ask_domain_ip(message, job: dict[str, Any]) -> None:
+    default_ip = job.get("default_ip") or _domain_default_ip()
+    await message.reply_text(
+        f"IP для A-записи @. По умолчанию <code>{escape(default_ip)}</code>.\n"
+        "Нажмите кнопку или пришлите другой адрес.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton(f"IP {default_ip}", callback_data="dom:ip:default")]]
+        ),
     )
-    _delete_persisted_wf(update, wf)
 
-    reply = (
-        f"<b>Шаг 5 — {STEP_LABELS[WorkflowStep.BACKEND]}</b>\n\n"
-        f"<b>ID:</b> {escape(str(app.panel_id))}\n"
-        f"<b>Bundle:</b> <code>{escape(app.bundle_name)}</code>\n"
-        f"<b>Site:</b> <code>{escape(app.site)}</code>\n"
-        f"<b>FB App ID:</b> <code>{escape(fb['app_id'])}</code>\n"
-        f"<b>Organic:</b> <code>{escape(organic_link)}</code>\n"
-        f'<b>Edit:</b> <a href="{escape(app.edit_url)}">{escape(app.edit_url)}</a>\n\n'
-        "✅ <b>Шаг 5 выполнен.</b> Android-бэкенд настроен."
+
+async def _show_domain_confirm(message, job: dict[str, Any]) -> None:
+    quotes = select_for_purchase(
+        _rows_to_quotes(job.get("quotes") or []),
+        max_price=float(job["max_price"]),
+        allow_over_limit=bool(job.get("allow_over_limit")),
     )
-    markup = None
-    next_st = next_step(WorkflowStep.BACKEND)
-    if next_st is not None:
-        markup = _step_keyboard(next_st)
-    await message.reply_text(reply, parse_mode=ParseMode.HTML, reply_markup=markup)
+    if not quotes:
+        job["stage"] = "done"
+        await message.reply_text("Нечего покупать: нет свободных доменов с ценой.")
+        return
+    job["domains"] = _domain_states_from_quotes(quotes)
+    job["stage"] = "confirm"
+    job["confirmed"] = False
+    text = _format_quote_list(quotes, limit=float(job["max_price"]))
+    await message.reply_text(
+        f"{text}\nIP: <code>{escape(str(job.get('ip')))}</code>\n\n"
+        "Это реальное списание на Dynadot. Подтвердите покупку.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Купить", callback_data="dom:buy:yes")],
+                [InlineKeyboardButton("Отмена", callback_data="dom:buy:no")],
+            ]
+        ),
+    )
+
+
+async def _prompt_domain_stage(update: Update, context: ContextTypes.DEFAULT_TYPE, job: dict[str, Any]) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    stage = job.get("stage")
+    if stage == "mode":
+        await message.reply_text(
+            "Выберите режим покупки.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Пачка случайных", callback_data="dom:mode:bulk")],
+                    [InlineKeyboardButton("Конкретные имена", callback_data="dom:mode:specific")],
+                ]
+            ),
+        )
+        return
+    if stage == "count":
+        await message.reply_text(f"Сколько доменов купить? Число от 1 до {MAX_BULK}.")
+        return
+    if stage == "names":
+        await message.reply_text("Пришлите домены, каждый с новой строки или через запятую.")
+        return
+    if stage == "ip":
+        await _ask_domain_ip(message, job)
+        return
+    if stage == "over_limit":
+        await message.reply_text("Подтвердите домены дороже лимита кнопкой выше.")
+        return
+    if stage == "confirm":
+        await _show_domain_confirm(message, job)
+        return
+    if stage in {"running", "failed"}:
+        await message.reply_text(
+            "Покупка остановилась. Можно повторить неудачные шаги.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Повторить упавшие шаги", callback_data="dom:retry")]]
+            ),
+        )
+
+
+async def handle_domain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _body() -> None:
+        query = update.callback_query
+        if not query or not query.data:
+            return
+        await query.answer()
+        job = _load_domain_job(update, context)
+        if not job:
+            await query.message.reply_text("Нет активной покупки. Начните с /domain")
+            return
+        data = query.data
+        if data == "dom:mode:bulk":
+            job["mode"] = "bulk"
+            job["stage"] = "count"
+            _save_domain_job(update, context, job)
+            await query.message.reply_text(f"Сколько доменов? От 1 до {MAX_BULK}. Только .top и .sbs.")
+            return
+        if data == "dom:mode:specific":
+            job["mode"] = "specific"
+            job["stage"] = "names"
+            _save_domain_job(update, context, job)
+            await query.message.reply_text("Пришлите точные имена, например backend42.top или несколько через запятую.")
+            return
+        if data == "dom:over:yes":
+            job["allow_over_limit"] = True
+            job["stage"] = "ip"
+            _save_domain_job(update, context, job)
+            await _ask_domain_ip(query.message, job)
+            return
+        if data == "dom:over:no":
+            job["allow_over_limit"] = False
+            job["stage"] = "ip"
+            _save_domain_job(update, context, job)
+            await _ask_domain_ip(query.message, job)
+            return
+        if data == "dom:ip:default":
+            job["ip"] = job.get("default_ip") or _domain_default_ip()
+            _save_domain_job(update, context, job)
+            await _show_domain_confirm(query.message, job)
+            _save_domain_job(update, context, job)
+            return
+        if data == "dom:buy:no":
+            job["stage"] = "done"
+            job["confirmed"] = False
+            _save_domain_job(update, context, job)
+            await query.message.reply_text("Покупка отменена. Деньги не списывал.")
+            return
+        if data in {"dom:buy:yes", "dom:retry"}:
+            if data == "dom:buy:yes":
+                job["confirmed"] = True
+            job["stage"] = "running"
+            _save_domain_job(update, context, job)
+            await _execute_domain_purchase(update, context, job)
+            return
+        await query.message.reply_text("Неизвестная кнопка.")
+
+    await _run_locked(update, _body)
+
+
+async def _execute_domain_purchase(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    job: dict[str, Any],
+) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    if not job.get("confirmed"):
+        await message.reply_text("Сначала подтвердите покупку кнопкой.")
+        return
+    crm = _get_crm_client()
+    if crm is None or not os.getenv("DYNADOT_API_KEY"):
+        await message.reply_text("Нет DYNADOT_API_KEY или CRM.")
+        return
+    await message.reply_text("Покупаю и настраиваю. По каждому домену напишу, что получилось.")
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    def emit(text: str) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, text)
+
+    def persist() -> None:
+        _save_domain_job(update, context, job)
+
+    async def _pump() -> None:
+        while True:
+            line = await queue.get()
+            if line is None:
+                return
+            await message.reply_text(line)
+
+    pump = asyncio.create_task(_pump())
+    try:
+        await asyncio.to_thread(
+            run_confirmed_batch,
+            job.get("domains") or [],
+            dynadot=DynadotClient(os.environ["DYNADOT_API_KEY"]),
+            crm=PortalDomainClient(crm),
+            ip=str(job.get("ip") or ""),
+            confirmed=True,
+            cf_factory=None,
+            emit=emit,
+            on_progress=persist,
+        )
+    except Exception as exc:
+        emit(f"Остановка: {exc}")
+        job["stage"] = "failed"
+    finally:
+        loop.call_soon_threadsafe(queue.put_nowait, None)
+        await pump
+    failed = [item for item in job.get("domains") or [] if item.get("failed_step")]
+    if failed:
+        job["stage"] = "failed"
+        _save_domain_job(update, context, job)
+        await message.reply_text(
+            "Часть доменов не доехала. Повтор идёт с упавшего шага, уже сделанное не повторяется.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Повторить упавшие шаги", callback_data="dom:retry")]]
+            ),
+        )
+        return
+    job["stage"] = "done"
+    _save_domain_job(update, context, job)
+    await message.reply_text("Готово: домены куплены и заведены в CRM.")
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Необработанная ошибка", exc_info=context.error)
+    if not isinstance(update, Update) or update.effective_message is None:
+        return
+    try:
+        await update.effective_message.reply_text(
+            "❌ <b>Ошибка</b>\n\nЧто-то пошло не так. Попробуйте ещё раз или нажмите «Повторить шаг».",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        logger.exception("Не удалось отправить сообщение об ошибке")
 
 
 def main() -> None:
@@ -1753,18 +1907,27 @@ def main() -> None:
     if not token:
         raise SystemExit("BOT_TOKEN не задан. Создайте файл .env с BOT_TOKEN=...")
 
+    allowed = sorted(allowed_user_ids())
+    if not allowed:
+        logger.warning("ALLOWED_USER_IDS пуст — бот не отвечает никому")
+    user_filter = filters.User(user_id=allowed)
+
     app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("step2", step2_dev))
-    app.add_handler(CommandHandler("back_android", back_android_dev))
-    app.add_handler(CallbackQueryHandler(handle_step_callback, pattern=r"^wf:"))
+    app.add_error_handler(on_error)
+    app.add_handler(CommandHandler("start", start, filters=user_filter))
+    app.add_handler(CommandHandler("app", app_command, filters=user_filter))
+    app.add_handler(CommandHandler("domain", domain_command, filters=user_filter))
+    app.add_handler(CommandHandler("step2", step2_dev, filters=user_filter))
+    app.add_handler(CommandHandler("back_android", back_android_dev, filters=user_filter))
+    app.add_handler(AllowedCallbackQueryHandler(handle_step_callback, user_filter, pattern=r"^wf:"))
+    app.add_handler(AllowedCallbackQueryHandler(handle_domain_callback, user_filter, pattern=r"^dom:"))
     app.add_handler(
         MessageHandler(
-            (filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,
+            user_filter & (filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,
             handle_message,
         )
     )
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(user_filter & filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger_steps = logging.getLogger("zavod.steps")
     logger_steps.info("Бот запущен. Логи: console + logs/bot.log (steps + HTTP)")
