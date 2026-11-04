@@ -186,6 +186,8 @@ def format_result(result: ShareResult) -> str:
             line = f"{line}\n{result.reason}"
     elif result.status == "already":
         line = f"{result.app} — уже настроено"
+    elif result.status == "conflict":
+        line = f"{result.app} — на данной приле уже есть интеграция с Юнити (Game ID {result.reason})"
     else:
         line = f"{result.app} — ошибка: {result.reason}"
     if result.links:
@@ -195,6 +197,17 @@ def format_result(result: ShareResult) -> str:
         if impression:
             line += f"\nпоказ: {impression}"
     return line
+
+
+UNITY_REPLACE_QUESTION = "На данной приле уже есть интеграция с Юнити, заменить гейм айди?"
+
+
+def unity_replace_pairs(task, results) -> list[tuple[str, str]]:
+    """Пары (приложение, новый game id) там, где Unity уже стоит с другим id."""
+    if getattr(task, "kind", "") != "unity":
+        return []
+    conflicts = {item.app for item in results if item.status == "conflict"}
+    return [(app, gid) for app, gid in task.pairs if app in conflicts]
 
 
 def _from_parsed(kind: str, parsed: ParsedShare, draft: dict, stamp: float) -> FlowStep:
