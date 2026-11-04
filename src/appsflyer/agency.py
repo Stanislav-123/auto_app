@@ -41,20 +41,15 @@ class AgencyUi(Protocol):
 def plan_event_picks(
     wanted: tuple[str, ...] | list[str],
     selected: list[str] | set[str],
-    available: list[str] | set[str],
     empty_rows: int,
 ) -> list[tuple[str, str]]:
-    """skip / missing / use_empty / add_row. Пропуск не занимает пустую строку."""
+    """skip / use_empty / add_row. Уже выбранное не трогаем, остальные добавляем всегда."""
     empty = empty_rows
     chosen = set(selected)
-    catalog = set(available)
     picks: list[tuple[str, str]] = []
     for event in wanted:
         if event in chosen:
             picks.append(("skip", event))
-            continue
-        if event not in catalog:
-            picks.append(("missing", event))
             continue
         if empty > 0:
             picks.append(("use_empty", event))
@@ -83,8 +78,7 @@ def drive_agency(ui: AgencyUi) -> list[str]:
             continue
         status = ui.add_event(event) or "added"
         if status == "missing":
-            done.append(f"missing:{event}")
-            continue
+            raise AfError(f"Событие {event} не появилось в списке")
         if status == "skipped":
             done.append(f"skip:{event}")
             present.add(event)

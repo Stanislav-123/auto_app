@@ -123,12 +123,7 @@ class _AgencyPage:
         )
 
     def known_events(self) -> list[str]:
-        assert self.session.page is not None
-        found = []
-        for name in ("af_app_opened", "af_complete_registration", "af_purchase"):
-            if self.session.page.locator(f'[data-qa-id="selected-option-{name}"]').count():
-                found.append(name)
-        return found
+        return self.session._selected_event_names()
 
     def add_event(self, name: str) -> str:
         return self.session._add_agency_event(name)
@@ -219,14 +214,9 @@ class PlaywrightAppsFlyer:
         self._raise_if_stuck(plan, "агентства")
         if plan.already:
             return ShareOutcome("already", "права уже стоят")
-        steps = self._apply_agency(plan)
+        self._apply_agency(plan)
         self._save_and_confirm()
-        missing = [item.split(":", 1)[1] for item in steps if item.startswith("missing:")]
-        if missing:
-            detail = "\n".join(f"{name} нет в списке событий приложения — пропущено" for name in missing)
-        else:
-            detail = "права сохранены"
-        return ShareOutcome("done", detail)
+        return ShareOutcome("done", "права сохранены")
 
     def configure_tiktok(self, app: str, tiktok_ids: list[str]) -> ShareOutcome:
         return self._configure_network(app, "tiktok", tags=tiktok_ids)
@@ -506,10 +496,7 @@ class PlaywrightAppsFlyer:
             item = nodes.nth(index)
             key = item.get_attribute("data-qa-id") or f"toggle-{index}"
             toggles[key] = (item.get_attribute("aria-checked") or "").lower() == "true"
-        events = []
-        for name in ("af_app_opened", "af_complete_registration", "af_purchase"):
-            if self.page.locator(f'[data-qa-id="selected-option-{name}"]').count():
-                events.append(name)
+        events = self._selected_event_names()
         sending = ""
         box = self.page.locator('[data-qa-id="agency-inapp-sending-options"]')
         if box.count():
@@ -548,14 +535,24 @@ class PlaywrightAppsFlyer:
     def _event_rows(self):
         return self._events_root().locator("div.permissions__inapp-item")
 
+    def _selected_event_names(self) -> list[str]:
+        assert self.page is not None
+        tags = self.page.locator("div.permissions__inapp-item .af-tag-value")
+        names: list[str] = []
+        for index in range(tags.count()):
+            text = tags.nth(index).inner_text().strip()
+            if text and text.lower() != "value is required" and text not in names:
+                names.append(text)
+        return names
+
     def _row_event_name(self, row) -> str:
-        marks = row.locator("[data-qa-id^='selected-option-']")
-        for index in range(marks.count()):
-            qa_id = marks.nth(index).get_attribute("data-qa-id") or ""
-            suffix = qa_id.removeprefix("selected-option-").strip()
-            if suffix:
-                return suffix
-        return ""
+        tag = row.locator(".af-tag-value")
+        if not tag.count():
+            return ""
+        text = tag.first.inner_text().strip()
+        if not text or text.lower() == "value is required":
+            return ""
+        return text
 
     def _empty_event_rows(self) -> list:
         rows = self._event_rows()
@@ -567,14 +564,12 @@ class PlaywrightAppsFlyer:
         return empty
 
     def _discard_event_row(self, row) -> None:
-        trash = row.locator("[data-qa-id^='selected-option-']")
-        if not trash.count():
-            trash = row.locator("button")
+        trash = row.locator("button")
         if trash.count():
-            trash.first.click()
+            trash.last.click()
 
     def _discard_empty_event_rows(self) -> None:
-        for _ in range(5):
+        for _ in range(8):
             empty = self._empty_event_rows()
             if not empty:
                 return
@@ -582,10 +577,9 @@ class PlaywrightAppsFlyer:
 
     def _add_agency_event(self, event: str) -> str:
         assert self.page is not None
-        root = self._events_root()
-        if root.locator(f'[data-qa-id="selected-option-{event}"]').count():
+        if event in self._selected_event_names():
             return "skipped"
-        created = False
+        root = self._events_root()
         empty = self._empty_event_rows()
         if not empty:
             self._focus('[data-qa-id="add-event"]')
@@ -593,45 +587,38 @@ class PlaywrightAppsFlyer:
             if not add.count():
                 add = self.page.locator("[data-qa-id=add-event]")
             add.first.click()
-            created = True
             root.locator("div.permissions__inapp-item").last.wait_for(state="visible")
             empty = self._empty_event_rows()
             if not empty:
                 raise AfError("Не появилась пустая строка события")
         row = empty[0]
         self._focus_row(row)
-        combo = row.locator("div.af-dropdown-inner[role=combobox]")
-        field = combo.locator("input.af-tag-input-input:not(.af-tag-input-input-hide)")
-        if field.count():
-            field.first.click()
-            try:
-                field.first.fill(event)
-            except Exception:
-                logger.info("af_event_type_skipped event=%s", event)
-        else:
-            combo.first.click()
-        listed = self._event_option(row, event)
-        if listed is None:
+        field = row.locator('input.af-tag-input-input[placeholder="Select..."]')
+        if not field.count():
+            field = row.locator("input.af-tag-input-input:not(.af-tag-input-input-hide)")
+        if not field.count():
+            raise AfError(f"Нет поля выбора события для {event}")
+        field.first.click()
+        field.first.press_sequentially(event, delay=20)
+        option = self.page.locator(
+            f'div.af-dropdown-list[role=listbox] [role=option]:has([data-title="{event}"])'
+        )
+        try:
+            option.first.wait_for(state="visible", timeout=self.timeout)
+        except Exception as exc:
             self.page.keyboard.press("Escape")
-            if created:
-                self._discard_event_row(row)
-            logger.info("af_event_missing event=%s", event)
-            return "missing"
-        listed.click()
-        root.locator(f'[data-qa-id="selected-option-{event}"]').first.wait_for(state="visible")
+            self._focus('[data-qa-id="add-event"]')
+            raise AfError(f"Событие {event} не появилось в списке") from exc
+        option.first.click()
+        self.page.wait_for_function(
+            """(eventName) => {
+                const tags = [...document.querySelectorAll('.permissions__inapp-item .af-tag-value')];
+                return tags.some((tag) => (tag.textContent || '').trim() === eventName);
+            }""",
+            arg=event,
+            timeout=self.timeout,
+        )
         return "added"
-
-    def _event_option(self, row, event: str):
-        assert self.page is not None
-        scoped = row.locator(f'[role=option]:has([data-title="{event}"])')
-        opened = self.page.locator(f'div.af-dropdown-list[role=listbox] [role=option]:has([data-title="{event}"])')
-        for option in (scoped, opened):
-            try:
-                option.first.wait_for(state="visible", timeout=4000)
-                return option.first
-            except Exception:
-                continue
-        return None
 
     def _focus_row(self, row) -> None:
         try:
