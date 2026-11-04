@@ -169,3 +169,44 @@ class LivePageTest(unittest.TestCase):
         ctx.pages = [old]
         with self.assertRaises(FcmKeyError):
             _live_page(old)
+
+
+class CookiesTest(unittest.TestCase):
+    def test_cookie_editor_json(self):
+        from src.firebase.cookies import normalize_cookies
+
+        raw = [
+            {"name": "SID", "value": "x", "domain": ".google.com", "path": "/", "sameSite": "no_restriction", "secure": True, "expirationDate": 1800000000.5},
+            {"name": "S", "value": "y", "domain": "accounts.google.com", "sameSite": "unspecified", "session": True},
+            {"name": "bad", "domain": ".google.com"},
+        ]
+        cookies = normalize_cookies(raw)
+        self.assertEqual(len(cookies), 2)
+        first = cookies[0]
+        self.assertEqual(first["sameSite"], "None")
+        self.assertEqual(first["expires"], 1800000000)
+        self.assertEqual(first["path"], "/")
+        self.assertEqual(cookies[1]["sameSite"], "Lax")
+        self.assertNotIn("expires", cookies[1])
+
+    def test_netscape(self):
+        import tempfile
+
+        from src.firebase.cookies import load_cookie_file
+
+        line = "\t".join([".google.com", "TRUE", "/", "TRUE", "1800000000", "SID", "secretval"])
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as handle:
+            handle.write("# Netscape HTTP Cookie File\n" + line + "\n")
+            name = handle.name
+        cookies = load_cookie_file(name)
+        self.assertEqual(cookies[0]["name"], "SID")
+        self.assertEqual(cookies[0]["domain"], ".google.com")
+        self.assertTrue(cookies[0]["secure"])
+
+
+class GoogleOnlyTest(unittest.TestCase):
+    def test_filters_other_sites(self):
+        from src.firebase.cookies import google_only
+
+        items = [{"domain": d} for d in (".google.com", "console.firebase.google.com", ".paypal.com", "fakegoogle.com", "accounts.google.com")]
+        self.assertEqual([c["domain"] for c in google_only(items)], [".google.com", "console.firebase.google.com", "accounts.google.com"])

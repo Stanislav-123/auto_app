@@ -11,6 +11,7 @@ from urllib.parse import quote
 
 from dataclasses import dataclass
 
+from .cookies import add_cookies_from_file, cookies_file
 from .key import FcmKeyError, extract_invite_links, parse_service_account, project_ref, rtdb_changes
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,12 @@ class FirebaseConsole:
             context = open_context(pw)
             try:
                 context.set_default_timeout(timeout_ms())
+                cookies = cookies_file()
+                if cookies:
+                    try:
+                        add_cookies_from_file(context, cookies)
+                    except Exception as exc:
+                        logger.warning("fb_cookies_failed error=%s", str(exc)[:160])
                 self.page = context.pages[0] if context.pages else context.new_page()
                 try:
                     found = self._open_project(project_id, name)
