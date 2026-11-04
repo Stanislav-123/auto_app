@@ -221,9 +221,8 @@ class _AgencyUi:
         return list(self.events)
 
     def add_event(self, name):
-        available = getattr(self, "available", None)
-        if available is not None and name not in available:
-            return "missing"
+        if getattr(self, "fail_on", None) == name:
+            raise AfError(f"Событие {name} не появилось в списке")
         self.events.append(name)
         return "added"
 
@@ -266,37 +265,53 @@ class TestAgencyOrder(unittest.TestCase):
         self.assertTrue(all(ui.on[item] for item in clicks))
         self.assertEqual(ui.sending_value, "send-all")
 
-    def test_missing_app_event_is_skipped(self):
-        picks = plan_event_picks(
+    def test_af_app_opened_is_always_added(self):
+        none_ready = plan_event_picks(
             ("af_app_opened", "af_complete_registration", "af_purchase"),
             [],
-            {"af_complete_registration", "af_purchase"},
+            0,
+        )
+        self.assertEqual(
+            none_ready,
+            [
+                ("add_row", "af_app_opened"),
+                ("add_row", "af_complete_registration"),
+                ("add_row", "af_purchase"),
+            ],
+        )
+        one_ready = plan_event_picks(
+            ("af_app_opened", "af_complete_registration", "af_purchase"),
+            [],
+            1,
+        )
+        self.assertEqual(one_ready[0], ("use_empty", "af_app_opened"))
+        self.assertEqual(one_ready[1], ("add_row", "af_complete_registration"))
+        ui = _AgencyUi()
+        steps = drive_agency(ui)
+        self.assertIn("event:af_app_opened", steps)
+
+    def test_event_that_never_appears_fails(self):
+        ui = _AgencyUi()
+        ui.fail_on = "af_app_opened"
+        with self.assertRaises(AfError) as caught:
+            drive_agency(ui)
+        self.assertIn("af_app_opened", str(caught.exception))
+        self.assertIn("не появилось", str(caught.exception))
+
+    def test_already_selected_event_does_not_take_a_row(self):
+        picks = plan_event_picks(
+            ("af_app_opened", "af_complete_registration", "af_purchase"),
+            ["af_purchase", "af_login"],
             1,
         )
         self.assertEqual(
             picks,
             [
-                ("missing", "af_app_opened"),
-                ("use_empty", "af_complete_registration"),
-                ("add_row", "af_purchase"),
+                ("use_empty", "af_app_opened"),
+                ("add_row", "af_complete_registration"),
+                ("skip", "af_purchase"),
             ],
         )
-        ui = _AgencyUi()
-        ui.available = {"af_complete_registration", "af_purchase"}
-        steps = drive_agency(ui)
-        self.assertIn("missing:af_app_opened", steps)
-        self.assertIn("event:af_complete_registration", steps)
-        self.assertIn("event:af_purchase", steps)
-        self.assertNotIn("event:af_app_opened", steps)
-
-    def test_already_selected_event_does_not_take_a_row(self):
-        picks = plan_event_picks(
-            ("af_purchase", "af_complete_registration"),
-            ["af_purchase"],
-            {"af_purchase", "af_complete_registration"},
-            1,
-        )
-        self.assertEqual(picks, [("skip", "af_purchase"), ("use_empty", "af_complete_registration")])
 
 
 class TestPlan(unittest.TestCase):
@@ -508,11 +523,7 @@ class TestMenu(unittest.TestCase):
         self.assertIn("готово", format_result(ShareResult("io.example.demo", "done")))
         self.assertIn("уже настроено", format_result(ShareResult("io.example.demo", "already")))
         self.assertIn("ошибка: нет страницы", format_result(ShareResult("io.example.demo", "failed", "нет страницы")))
-        note = format_result(
-            ShareResult("coc.carwer.towrush", "done", "af_app_opened нет в списке событий приложения — пропущено")
-        )
-        self.assertIn("готово", note)
-        self.assertIn("af_app_opened нет в списке событий приложения — пропущено", note)
+        self.assertNotIn("пропущено", format_result(ShareResult("coc.carwer.towrush", "done", "права сохранены")))
 
 
 class _State:
