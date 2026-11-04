@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 from src.appsflyer.flow import (
     begin_share,
@@ -19,6 +21,7 @@ from src.appsflyer.plan import (
     plan_agency,
     plan_integration,
 )
+from src.appsflyer.playwright_session import PlaywrightAppsFlyer
 from src.appsflyer.session import (
     AfBlocked,
     ShareOutcome,
@@ -110,6 +113,37 @@ class TestParse(unittest.TestCase):
     def test_unknown_token(self):
         with self.assertRaises(ParseError):
             parse_share("tiktok", f"{TIKTOK} not-an-app")
+
+    def test_ios_links_prefix_and_bare_number(self):
+        store = "https://apps.apple.com/us/app/some-name/id1234567890?mt=8"
+        itunes = "https://itunes.apple.com/jp/app/some-name/id1234567891"
+        parsed = parse_share("agency", f"agencytest1 {store} {itunes} ID1234567892 123456789012 {PLAY}")
+        self.assertEqual(
+            parsed.apps,
+            ["id1234567890", "id1234567891", "id1234567892", "id123456789012", "io.example.demo"],
+        )
+
+    def test_ios_mixed_with_tiktok_ids(self):
+        parsed = parse_share("tiktok", f"{TIKTOK} id1234567890 io.example.demo")
+        self.assertEqual(parsed.ids, [TIKTOK])
+        self.assertEqual(parsed.apps, ["id1234567890", "io.example.demo"])
+
+    def test_unity_ios_app_after_game_id(self):
+        one_line = parse_share("unity", "100000001 1234567890")
+        self.assertEqual(one_line.pairs, [("id1234567890", "100000001")])
+        prefixed = parse_share("unity", "id1234567890 100000001")
+        self.assertEqual(prefixed.pairs, [("id1234567890", "100000001")])
+        lines = parse_share("unity", "100000001\n1234567890\nio.example.demo")
+        self.assertEqual(
+            lines.pairs,
+            [("id1234567890", "100000001"), ("io.example.demo", "100000001")],
+        )
+
+    def test_partner_link_with_ios_app(self):
+        link = "https://hq1.appsflyer.com/marketplace/integrated-partners/id1234567890/agencytest1"
+        parsed = parse_share("agency", f"{link} io.example.demo")
+        self.assertEqual(parsed.partner_id, "agencytest1")
+        self.assertEqual(parsed.apps, ["io.example.demo"])
 
 
 class TestPlan(unittest.TestCase):
@@ -238,6 +272,10 @@ class TestShareRun(unittest.TestCase):
         self.assertIn("капча", login_blocked_reason("I'm not a robot"))
         self.assertIsNone(login_blocked_reason("Permissions"))
         self.assertIn("agencytest1", partner_config_url("io.example.demo", "agencytest1"))
+        self.assertEqual(
+            partner_config_url("id1234567890", "tiktokglobal_int"),
+            "https://hq1.appsflyer.com/marketplace/integrated-partners/id1234567890/tiktokglobal_int",
+        )
 
 
 class TestMenu(unittest.TestCase):
@@ -277,6 +315,16 @@ class TestMenu(unittest.TestCase):
         self.assertEqual(step.task.apps, ["io.example.demo", OTHER])
         self.assertFalse(share_expects_text(step.job))
 
+    def test_wizard_accepts_ios_apps(self):
+        step = begin_share("snapchat", "")
+        step = continue_share(step.job, SNAP)
+        self.assertIn("iOS", step.messages[0])
+        step = continue_share(
+            step.job,
+            "https://apps.apple.com/de/app/name/id1234567890\n123456789012",
+        )
+        self.assertEqual(step.task.apps, ["id1234567890", "id123456789012"])
+
     def test_command_runs_immediately(self):
         step = begin_share("tiktok", f"/share_tiktok {TIKTOK} {PLAY}")
         self.assertEqual(step.task.ids, [TIKTOK])
@@ -300,11 +348,205 @@ class TestMenu(unittest.TestCase):
             self.assertIn(name, text)
         self.assertIn("массовая покупка", text)
         self.assertIn("tiktokglobal_int", text)
+        self.assertIn("iOS", text)
+        self.assertIn("apps.apple.com", text)
 
     def test_result_labels(self):
         self.assertIn("готово", format_result(ShareResult("io.example.demo", "done")))
         self.assertIn("уже настроено", format_result(ShareResult("io.example.demo", "already")))
         self.assertIn("ошибка: нет страницы", format_result(ShareResult("io.example.demo", "failed", "нет страницы")))
+
+
+class _State:
+    def __init__(self):
+        self.path = None
+
+    def storage_state(self, path):
+        self.path = path
+
+
+class _Locator:
+    def __init__(self, page, selector):
+        self.page = page
+        self.selector = selector
+
+    def _shown(self):
+        if getattr(self.page, "captcha", False) and "recaptcha" in self.selector:
+            return True
+        if self.selector == "either":
+            return self.page.mode in {"login", "content"}
+        if self.page.mode == "login":
+            folded = self.selector.lower()
+            return any(token in folded for token in ("password", "email", "checkbox", "remember", "button", "login"))
+        if self.page.mode == "content":
+            return "msc__content" in self.selector or "af-content-wrapper" in self.selector
+        return False
+
+    def count(self):
+        return 1 if self._shown() else 0
+
+    @property
+    def first(self):
+        return self
+
+    def nth(self, index):
+        return self
+
+    def is_visible(self):
+        return self._shown()
+
+    def is_checked(self):
+        return False
+
+    def wait_for(self, state="visible", timeout=None):
+        if not self._shown():
+            raise TimeoutError(self.selector)
+
+    def or_(self, other):
+        return _Locator(self.page, "either")
+
+    def fill(self, value):
+        if "password" in self.selector.lower():
+            self.page.password_filled = value
+        else:
+            self.page.email_filled = value
+
+    def click(self):
+        self.page.clicked.append(self.selector)
+        folded = self.selector.lower()
+        if "button" in folded and "login" in folded and "google" not in folded and "sso" not in folded:
+            self.page.logged_in = True
+            self.page.url = "https://hq1.appsflyer.com/apps/myapps"
+            self.page.mode = "content"
+
+    def check(self):
+        self.page.remembered = True
+
+    def inner_text(self):
+        return "Login"
+
+    def get_attribute(self, name):
+        return None
+
+    def locator(self, selector):
+        return _Locator(self.page, selector)
+
+
+class _LoginPage:
+    """Редирект на форму входа, пока сессии нет. После Login открывается кабинет."""
+
+    def __init__(self, challenge=None):
+        self.url = "about:blank"
+        self.mode = "blank"
+        self.logged_in = False
+        self.challenge = challenge
+        self.actions = []
+        self.clicked = []
+        self.email_filled = None
+        self.password_filled = None
+        self.remembered = False
+        self.captcha = False
+
+    def goto(self, url, wait_until=None):
+        self.actions.append(url)
+        if self.logged_in:
+            self.url = url
+            self.mode = "content"
+            return
+        self.url = "https://hq1.appsflyer.com/auth/login"
+        self.mode = "login"
+
+    def locator(self, selector):
+        return _Locator(self, selector)
+
+    def get_by_role(self, role, name=None):
+        pattern = getattr(name, "pattern", name) or ""
+        return _Locator(self, f"role-{role}-{pattern}")
+
+    def get_by_text(self, pattern):
+        return _Locator(self, "text")
+
+    def wait_for_function(self, script, timeout=None):
+        if not self.logged_in:
+            raise TimeoutError("still on login")
+
+    def wait_for_load_state(self, state, timeout=None):
+        return None
+
+    def inner_text(self, selector="body"):
+        if self.challenge == "2fa":
+            return "Enter the verification code from your authenticator"
+        if self.mode == "login":
+            return "Email Enter your email address Password Enter password Remember me Login Log in with Google"
+        return "Permissions"
+
+    def content(self):
+        return self.inner_text("body")
+
+
+class TestLoginRedirect(unittest.TestCase):
+    def _session(self, page):
+        session = PlaywrightAppsFlyer("user@example.com", "secret-pass")
+        session.page = page
+        session._context = _State()
+        folder = tempfile.mkdtemp()
+        session.state_file = Path(folder) / "state.json"
+        self.addCleanup(lambda: __import__("shutil").rmtree(folder, ignore_errors=True))
+        return session
+
+    def test_partner_redirect_logs_in_and_continues(self):
+        page = _LoginPage()
+        session = self._session(page)
+        with self.assertLogs("src.appsflyer.playwright_session", level="INFO") as logs:
+            session._open_partner("coc.carwer.towrush", "vozartltd")
+        text = "\n".join(logs.output)
+        self.assertIn("af_login", text)
+        self.assertNotIn("secret-pass", text)
+        self.assertEqual(page.email_filled, "user@example.com")
+        self.assertEqual(page.password_filled, "secret-pass")
+        self.assertTrue(page.remembered)
+        self.assertTrue(any("coc.carwer.towrush" in url and "vozartltd" in url for url in page.actions))
+        self.assertGreaterEqual(sum("coc.carwer.towrush" in url for url in page.actions), 2)
+        self.assertIn("integrated-partners/coc.carwer.towrush/vozartltd", page.url)
+        self.assertEqual(page.mode, "content")
+        self.assertIsNotNone(session._context.path)
+        self.assertFalse(any("google" in item.lower() for item in page.clicked))
+
+    def test_session_check_then_share(self):
+        page = _LoginPage()
+        session = self._session(page)
+        opened = []
+
+        def configure_agency(app, partner_id):
+            session._open_partner(app, partner_id)
+            opened.append((app, partner_id, page.mode))
+            return ShareOutcome("done")
+
+        session.configure_agency = configure_agency
+        task = ShareTask(kind="agency", partner_id="vozartltd", apps=["coc.carwer.towrush"])
+        results = run_share(task, session)
+        self.assertEqual(results[0].status, "done")
+        self.assertEqual(opened, [("coc.carwer.towrush", "vozartltd", "content")])
+        self.assertEqual(page.email_filled, "user@example.com")
+        self.assertTrue(page.remembered)
+
+    def test_two_factor_stops_without_saving_session(self):
+        page = _LoginPage(challenge="2fa")
+        session = self._session(page)
+        with self.assertRaises(AfBlocked) as caught:
+            session.ensure_session()
+        self.assertIn("2FA", str(caught.exception))
+        self.assertIsNone(page.password_filled)
+        self.assertIsNone(session._context.path)
+
+    def test_visible_captcha_stops(self):
+        page = _LoginPage()
+        page.captcha = True
+        session = self._session(page)
+        with self.assertRaises(AfBlocked) as caught:
+            session._open_partner("coc.carwer.towrush", "vozartltd")
+        self.assertIn("капча", str(caught.exception))
+        self.assertIsNone(page.password_filled)
 
 
 if __name__ == "__main__":

@@ -9,24 +9,28 @@ from src.appsflyer.session import ShareResult, ShareTask
 
 _WAITING = {"partner", "ids", "apps", "pairs"}
 
+_APPS = (
+    "Android: bundle или ссылка Google Play. "
+    "iOS: ссылка App Store или iTunes, <code>id1234567890</code> либо 9–12 цифр. "
+    "Несколько — столбиком, через пробел или запятую."
+)
+
 _PROMPTS = {
     ("agency", "partner"): (
         "Пришлите id агентства AppsFlyer или ссылку на партнёра.\n"
-        "Потом отдельно — приложения."
+        "Потом отдельно — приложения Android или iOS."
     ),
-    ("agency", "apps"): (
-        "Пришлите приложения: bundle или ссылка Google Play.\n"
-        "Несколько можно столбиком, через пробел или запятую."
-    ),
+    ("agency", "apps"): "Пришлите приложения.\n" + _APPS,
     ("tiktok", "ids"): "Пришлите TikTok App ID, один или несколько. Это числа из 16–20 цифр.",
-    ("tiktok", "apps"): "Пришлите приложения для TikTok: bundle или ссылка Google Play.",
+    ("tiktok", "apps"): "Пришлите приложения для TikTok.\n" + _APPS,
     ("unity", "pairs"): (
-        "Пришлите Unity Ads Game ID и приложение.\n"
+        "Пришлите Unity Ads Game ID и приложение Android или iOS.\n"
         "Одна пара в строке, либо один game id и дальше список приложений.\n"
-        "Пример:\n<code>100000001 io.example.demo</code>"
+        "Пример:\n<code>100000001 io.example.demo</code>\n"
+        "<code>100000001 id1234567890</code>"
     ),
     ("snapchat", "ids"): "Пришлите Snap App ID (UUID), один или несколько.",
-    ("snapchat", "apps"): "Пришлите приложения для Snapchat: bundle или ссылка Google Play.",
+    ("snapchat", "apps"): "Пришлите приложения для Snapchat.\n" + _APPS,
 }
 
 
@@ -87,8 +91,10 @@ def help_text() -> str:
         "/domain — покупка и настройка доменов.\n"
         "/menu — кнопки: завод, домены, расшарка.\n\n"
         "<b>Расшарка AppsFlyer</b>\n"
-        "Приложения: bundle (<code>io.example.demo</code>) или ссылка "
-        "Google Play (<code>https://play.google.com/store/apps/details?id=io.example.demo</code>). "
+        "Приложения Android или iOS. Android: bundle <code>io.example.demo</code> или ссылка "
+        "Google Play. iOS: <code>https://apps.apple.com/us/app/some-name/id1234567890</code>, "
+        "ссылка iTunes, <code>id1234567890</code> или 9–12 цифр. "
+        "В AppsFlyer iOS id идёт с префиксом id. "
         "Несколько — с новой строки, через пробел или запятую. По каждому приложению будет ответ: "
         "готово, уже настроено или ошибка.\n\n"
         "/share_partner &lt;id агентства или ссылка AF&gt; &lt;приложения&gt;\n"
@@ -97,7 +103,7 @@ def help_text() -> str:
         "/share_tiktok &lt;TikTok App ID...&gt; &lt;приложения&gt;\n"
         "Партнёр tiktokglobal_int. ID не дублируются. События: LaunchAPP, Registration, Purchase.\n\n"
         "/share_unity &lt;game id&gt; &lt;приложение&gt;\n"
-        "Несколько приложений — пара в каждой строке: game id и bundle. "
+        "Несколько приложений — пара в каждой строке: game id и приложение Android или iOS. "
         "Партнёр unityads_int. В ответ придут click и impression ссылки.\n\n"
         "/share_snapchat &lt;Snap App ID...&gt; &lt;приложения&gt;\n"
         "Партнёр snapchat_int. События: APP_OPEN, SIGN_UP, PURCHASE.\n\n"

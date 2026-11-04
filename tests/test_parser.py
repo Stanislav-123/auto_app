@@ -143,6 +143,24 @@ Backend: Новый
         app = parse_app_message(msg)
         self.assertEqual(app.backend_domain, "other.sbs")
 
+    def test_itunes_and_query_are_ios(self):
+        itunes = parse_app_message(
+            "Новое IOS приложение\n\nName\n"
+            "https://itunes.apple.com/gb/app/some-name/id1234567890?mt=8\n\n"
+            "Bundle: com.example.ios\nBackend: Новый\n"
+        )
+        self.assertEqual(itunes.platform.value, "ios")
+        self.assertEqual(itunes.store_id, "id1234567890")
+        queried = parse_app_message(
+            "Новое IOS приложение\n\nName\n"
+            "https://apps.apple.com/us/app/some-name/id1234567891?mt=8\n\n"
+            "Bundle: com.example.ios\nBackend: Новый\n"
+        )
+        self.assertEqual(queried.store_id, "id1234567891")
+        android = parse_app_message(ANDROID_MESSAGE)
+        self.assertEqual(android.platform.value, "android")
+        self.assertEqual(android.store_id, "com.aurumatlas.eonatelier")
+
     def test_merge_platform_reply(self):
         incomplete = parse_app_message("TEST\nBundle: com.example.app")
         self.assertEqual(incomplete.platform.value, "unknown")

@@ -33,6 +33,11 @@ from src.appsflyer.session import (
 
 logger = logging.getLogger(__name__)
 
+_SECTION_LABELS = {
+    "extra-params": re.compile(r"TikTok App ID|Snap App ID|Unity Ads Game ID|Game ID|App ID", re.IGNORECASE),
+    "inapp-extra-params": re.compile(r"Unity Ads Game ID|Game ID", re.IGNORECASE),
+}
+
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -62,6 +67,7 @@ class PlaywrightAppsFlyer:
         self._browser = None
         self._context = None
         self.page = None
+        self._target_url = None
 
     @classmethod
     def from_env(cls) -> PlaywrightAppsFlyer:
@@ -152,63 +158,112 @@ class PlaywrightAppsFlyer:
         self._save_and_confirm()
         return ShareOutcome("done", "интеграция сохранена")
 
+    def ensure_session(self) -> None:
+        """До пачки: если сессии нет, форма логина уже на экране — входим сразу."""
+        if self.page is None:
+            return
+        logger.info("af_session_check")
+        self._target_url = None
+        self._goto(LOGIN_URL)
+        if self._race_content_or_login() != "login":
+            return
+        self._login_and_store()
+        if self._login_form_visible():
+            self._raise_if_still_login()
+
     def _open_partner(self, app: str, partner_id: str) -> None:
         url = partner_config_url(app, partner_id)
+        self._target_url = url
         logger.info("af_open app=%s partner=%s", app, partner_id)
         self._goto(url)
-        self._ensure_logged_in(url)
-        blocked = self._blocked_reason()
-        if blocked:
-            raise AfBlocked(blocked)
         self._wait_content()
+        self._note_store_banner()
 
     def _goto(self, url: str) -> None:
         assert self.page is not None
         self.page.goto(url, wait_until="domcontentloaded")
 
-    def _ensure_logged_in(self, back_url: str) -> None:
-        if not self._needs_login():
-            return
-        logger.info("af_login")
-        self._login()
-        self._goto(back_url)
-        if self._needs_login():
-            blocked = self._blocked_reason()
-            if blocked:
-                raise AfBlocked(blocked)
-            raise AfError("Не удалось войти в AppsFlyer.")
-
-    def _needs_login(self) -> bool:
+    def _login_form_visible(self) -> bool:
         assert self.page is not None
         url = (self.page.url or "").lower()
         if "/auth/login" in url or url.rstrip("/").endswith("/login"):
             return True
-        password = self.page.locator("input[type=password]")
-        return password.count() > 0 and "integrated-partners" not in url
+        for selector in (
+            "input[type=password]",
+            "input[placeholder*='Enter password' i]",
+            "input[placeholder*='Enter your email' i]",
+            "input[type=email]",
+        ):
+            field = self.page.locator(selector)
+            try:
+                if field.count() and field.first.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
 
-    def _login(self) -> None:
+    def _race_content_or_login(self) -> str:
+        """Ждём либо кабинет, либо форму входа. Редирект на логин не должен висеть на main."""
         assert self.page is not None
-        self._goto(LOGIN_URL)
+        content = self.page.locator("main.msc__content, main.af-content-wrapper")
+        login = self.page.locator(
+            "input[type=password], input[placeholder*='Enter password' i], "
+            "input[placeholder*='Enter your email' i], input[type=email]"
+        )
+        try:
+            content.or_(login).first.wait_for(state="visible", timeout=self.timeout)
+        except Exception as exc:
+            blocked = self._blocked_reason()
+            if blocked:
+                raise AfBlocked(blocked) from exc
+            raise AfError("Страница AppsFlyer не открылась: ни кабинет, ни форма входа.") from exc
         blocked = self._blocked_reason()
         if blocked:
             raise AfBlocked(blocked)
-        email = self.page.locator("input[type=email], input[name=username], input[name=email]").first
-        password = self.page.locator("input[type=password]").first
-        email.fill(self.email)
-        password.fill(self.password)
-        form = self.page.locator("form").filter(has=self.page.locator("input[type=password]")).first
-        submit = form.locator("button[type=submit]")
-        if submit.count():
-            submit.first.click()
+        if self._login_form_visible():
+            return "login"
+        return "content"
+
+    def _login_and_store(self) -> None:
+        logger.info("af_login")
+        self._submit_login()
+        self._save_state()
+
+    def _submit_login(self) -> None:
+        assert self.page is not None
+        blocked = self._blocked_reason()
+        if blocked:
+            raise AfBlocked(blocked)
+        email = self.page.locator(
+            "input[type=email], input[name=username], input[name=email], "
+            "input[placeholder*='email' i], input[autocomplete=username]"
+        )
+        password = self.page.locator("input[type=password], input[placeholder*='password' i]")
+        if not email.count() or not password.count():
+            raise AfError("Форма входа AppsFlyer без полей email и password.")
+        email.first.fill(self.email)
+        password.first.fill(self.password)
+        remember = self.page.get_by_role("checkbox", name=re.compile(r"Remember me", re.I))
+        if remember.count():
+            if not remember.first.is_checked():
+                remember.first.check()
         else:
-            self.page.locator("button[type=submit]").first.click()
-        self.page.wait_for_timeout(1500)
+            box = self.page.locator("input[type=checkbox]")
+            if box.count() and not box.first.is_checked():
+                box.first.check()
+        self._click_login()
         blocked = self._blocked_reason()
         if blocked:
             raise AfBlocked(blocked)
         try:
             self.page.wait_for_function(
-                "() => !location.pathname.includes('/auth/login') && !location.pathname.endsWith('/login')",
+                """() => {
+                    const path = location.pathname.toLowerCase();
+                    const onLogin = path.includes('/auth/login') || path.endsWith('/login');
+                    const pwd = document.querySelector("input[type=password]");
+                    const visible = pwd && pwd.offsetParent !== null;
+                    return !onLogin && !visible;
+                }""",
                 timeout=self.timeout,
             )
         except Exception as exc:
@@ -216,7 +271,32 @@ class PlaywrightAppsFlyer:
             if blocked:
                 raise AfBlocked(blocked) from exc
             raise AfError("Не удалось войти в AppsFlyer.") from exc
-        self._save_state()
+
+    def _click_login(self) -> None:
+        assert self.page is not None
+        button = self.page.get_by_role("button", name=re.compile(r"^(log ?in|login)$", re.I))
+        if button.count():
+            button.first.click()
+            return
+        submit = self.page.locator("button[type=submit], input[type=submit]")
+        for index in range(submit.count()):
+            item = submit.nth(index)
+            label = ""
+            try:
+                label = item.inner_text().lower()
+            except Exception:
+                label = (item.get_attribute("value") or "").lower()
+            if "google" in label or "sso" in label:
+                continue
+            item.click()
+            return
+        raise AfError("Не нашёл кнопку Login.")
+
+    def _raise_if_still_login(self) -> None:
+        blocked = self._blocked_reason()
+        if blocked:
+            raise AfBlocked(blocked)
+        raise AfError("Не удалось войти в AppsFlyer.")
 
     def _blocked_reason(self) -> str | None:
         assert self.page is not None
@@ -224,15 +304,28 @@ class PlaywrightAppsFlyer:
             text = self.page.inner_text("body")
         except Exception:
             text = ""
+        reason = login_blocked_reason(text)
+        if reason:
+            return reason
+        frame = self.page.locator(
+            "iframe[src*='recaptcha'], iframe[src*='hcaptcha'], iframe[title*='recaptcha' i]"
+        )
         try:
-            html = self.page.content()
+            if frame.count() and frame.first.is_visible():
+                return "На странице капча. Войдите в AppsFlyer вручную и повторите команду."
         except Exception:
-            html = ""
-        return login_blocked_reason(f"{text}\n{html}")
+            return None
+        return None
 
     def _wait_content(self) -> None:
         assert self.page is not None
-        self.page.locator("main.msc__content, main.af-content-wrapper").first.wait_for(state="visible")
+        if self._race_content_or_login() == "login":
+            self._login_and_store()
+            target = getattr(self, "_target_url", None)
+            if target:
+                self._goto(target)
+            if self._race_content_or_login() == "login":
+                self._raise_if_still_login()
         try:
             self.page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
@@ -392,9 +485,46 @@ class PlaywrightAppsFlyer:
                 label="Values & revenue",
             )
 
-    def _read_tags(self, root_qa: str) -> list[str]:
+    def _note_store_banner(self) -> None:
+        """На iOS в баннере IDFA, на Android — GAID. Текст разный, поля те же."""
+        assert self.page is not None
+        try:
+            text = self.page.inner_text("body")
+        except Exception:
+            return
+        if re.search(r"\bIDFA\b", text):
+            logger.info("af_notice kind=idfa")
+        elif re.search(r"\bGAID\b|Google Advertising ID", text, re.IGNORECASE):
+            logger.info("af_notice kind=gaid")
+
+    def _section(self, root_qa: str):
         assert self.page is not None
         root = self.page.locator(f'[data-qa-id="{root_qa}"]')
+        if root.count():
+            return root
+        pattern = _SECTION_LABELS.get(root_qa)
+        if pattern is None:
+            return root
+        label = self.page.get_by_text(pattern)
+        if not label.count():
+            return root
+        return label.first.locator("xpath=ancestor::div[.//input][1]")
+
+    def _text_field(self, root):
+        field = root.locator("[data-qa-id=game_id] input[data-qa-id=text-field-input]")
+        if field.count():
+            return field.first
+        field = root.locator("input[data-qa-id=text-field-input]")
+        if field.count():
+            return field.first
+        field = root.locator("input[type=text]")
+        if field.count():
+            return field.last
+        return None
+
+    def _read_tags(self, root_qa: str) -> list[str]:
+        assert self.page is not None
+        root = self._section(root_qa)
         if not root.count():
             return []
         found: list[str] = []
@@ -410,30 +540,29 @@ class PlaywrightAppsFlyer:
 
     def _add_tag(self, value: str) -> None:
         assert self.page is not None
-        field = self.page.locator('[data-qa-id="extra-params"] input[type=text]').last
+        field = self._text_field(self._section("extra-params"))
+        if field is None:
+            raise AfError("Не нашёл поле App ID (ни Android, ни iOS).")
         field.click()
         field.fill(value)
         field.press("Enter")
 
     def _read_input(self, root_qa: str) -> str:
         assert self.page is not None
-        root = self.page.locator(f'[data-qa-id="{root_qa}"]')
+        root = self._section(root_qa)
         if not root.count():
             return ""
-        field = root.locator("[data-qa-id=game_id] input[data-qa-id=text-field-input]")
-        if not field.count():
-            field = root.locator("input[data-qa-id=text-field-input]")
-        if not field.count():
+        field = self._text_field(root)
+        if field is None:
             return ""
-        return field.first.input_value().strip()
+        return field.input_value().strip()
 
     def _fill_input(self, root_qa: str, value: str) -> None:
         assert self.page is not None
-        root = self.page.locator(f'[data-qa-id="{root_qa}"]')
-        field = root.locator("[data-qa-id=game_id] input[data-qa-id=text-field-input]")
-        if not field.count():
-            field = root.locator("input[data-qa-id=text-field-input]")
-        field.first.fill(value)
+        field = self._text_field(self._section(root_qa))
+        if field is None:
+            raise AfError("Не нашёл поле Game ID.")
+        field.fill(value)
 
     def _read_rows(self) -> list[EventRow]:
         assert self.page is not None
@@ -578,7 +707,7 @@ class PlaywrightAppsFlyer:
         if self._context is None or self.page is None:
             return
         try:
-            if self._needs_login():
+            if self._login_form_visible():
                 return
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
             self._context.storage_state(path=str(self.state_file))
