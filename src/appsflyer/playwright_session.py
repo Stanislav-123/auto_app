@@ -130,26 +130,24 @@ class _AgencyPage:
                 found.append(name)
         return found
 
-    def add_event(self, name: str) -> None:
-        self.session._add_agency_event(name)
+    def add_event(self, name: str) -> str:
+        return self.session._add_agency_event(name)
 
     def sending(self) -> str:
         assert self.session.page is not None
         box = self.session.page.locator('[data-qa-id="agency-inapp-sending-options"]')
         if not box.count():
             return ""
-        button = box.locator("button[data-qa-id=select-button]")
-        if not button.count():
-            return box.inner_text()
-        return button.first.get_attribute("data-value") or button.first.inner_text()
+        tag = box.locator(".af-tag-value")
+        if tag.count():
+            return tag.first.inner_text()
+        return box.inner_text()
 
     def set_sending(self) -> None:
-        self.session._focus('[data-qa-id="agency-inapp-sending-options"]')
-        self.session._choose(
-            "agency-inapp-sending-options",
-            data_value="send-all",
-            label="All media sources, including organic",
-        )
+        self.session._set_agency_sending()
+
+    def discard_empty_rows(self) -> None:
+        self.session._discard_empty_event_rows()
 
 
 class PlaywrightAppsFlyer:
@@ -221,9 +219,14 @@ class PlaywrightAppsFlyer:
         self._raise_if_stuck(plan, "агентства")
         if plan.already:
             return ShareOutcome("already", "права уже стоят")
-        self._apply_agency(plan)
+        steps = self._apply_agency(plan)
         self._save_and_confirm()
-        return ShareOutcome("done", "права сохранены")
+        missing = [item.split(":", 1)[1] for item in steps if item.startswith("missing:")]
+        if missing:
+            detail = "\n".join(f"{name} нет в списке событий приложения — пропущено" for name in missing)
+        else:
+            detail = "права сохранены"
+        return ShareOutcome("done", detail)
 
     def configure_tiktok(self, app: str, tiktok_ids: list[str]) -> ShareOutcome:
         return self._configure_network(app, "tiktok", tags=tiktok_ids)
@@ -510,9 +513,9 @@ class PlaywrightAppsFlyer:
         sending = ""
         box = self.page.locator('[data-qa-id="agency-inapp-sending-options"]')
         if box.count():
-            button = box.locator("button[data-qa-id=select-button]")
-            if button.count():
-                sending = button.first.get_attribute("data-value") or button.first.inner_text()
+            tag = box.locator(".af-tag-value")
+            if tag.count():
+                sending = tag.first.inner_text()
             elif sending_is_all(box.inner_text()):
                 sending = "send-all"
         return AgencyPage(
@@ -522,9 +525,9 @@ class PlaywrightAppsFlyer:
             sending=sending,
         )
 
-    def _apply_agency(self, plan: AgencyPlan) -> None:
+    def _apply_agency(self, plan: AgencyPlan) -> list[str]:
         del plan
-        drive_agency(_AgencyPage(self))
+        return drive_agency(_AgencyPage(self))
 
     def _focus(self, selector: str) -> None:
         self._focus_selector = selector
@@ -533,22 +536,137 @@ class PlaywrightAppsFlyer:
         if target.count():
             target.first.scroll_into_view_if_needed()
 
-    def _add_agency_event(self, event: str) -> None:
+    def _events_root(self):
         assert self.page is not None
-        if self.page.locator(f'[data-qa-id="selected-option-{event}"]').count():
-            return
-        self._focus('[data-qa-id="add-event"]')
-        button = self.page.locator('[data-qa-id="add-event"]')
-        button.first.wait_for(state="visible")
-        button.first.click()
-        search = self.page.locator("input[role=combobox], [role=listbox] input, input[type=text]").last
-        search.click()
-        search.fill(event)
+        root = self.page.locator("div.permissions__in-app-events")
+        if root.count():
+            return root
+        return self.page.locator("[data-qa-id=add-event]").locator(
+            "xpath=ancestor::div[contains(@class,'permissions')][1]"
+        )
+
+    def _event_rows(self):
+        return self._events_root().locator("div.permissions__inapp-item")
+
+    def _row_event_name(self, row) -> str:
+        marks = row.locator("[data-qa-id^='selected-option-']")
+        for index in range(marks.count()):
+            qa_id = marks.nth(index).get_attribute("data-qa-id") or ""
+            suffix = qa_id.removeprefix("selected-option-").strip()
+            if suffix:
+                return suffix
+        return ""
+
+    def _empty_event_rows(self) -> list:
+        rows = self._event_rows()
+        empty = []
+        for index in range(rows.count()):
+            row = rows.nth(index)
+            if not self._row_event_name(row):
+                empty.append(row)
+        return empty
+
+    def _discard_event_row(self, row) -> None:
+        trash = row.locator("[data-qa-id^='selected-option-']")
+        if not trash.count():
+            trash = row.locator("button")
+        if trash.count():
+            trash.first.click()
+
+    def _discard_empty_event_rows(self) -> None:
+        for _ in range(5):
+            empty = self._empty_event_rows()
+            if not empty:
+                return
+            self._discard_event_row(empty[0])
+
+    def _add_agency_event(self, event: str) -> str:
+        assert self.page is not None
+        root = self._events_root()
+        if root.locator(f'[data-qa-id="selected-option-{event}"]').count():
+            return "skipped"
+        created = False
+        empty = self._empty_event_rows()
+        if not empty:
+            self._focus('[data-qa-id="add-event"]')
+            add = root.locator("[data-qa-id=add-event]")
+            if not add.count():
+                add = self.page.locator("[data-qa-id=add-event]")
+            add.first.click()
+            created = True
+            root.locator("div.permissions__inapp-item").last.wait_for(state="visible")
+            empty = self._empty_event_rows()
+            if not empty:
+                raise AfError("Не появилась пустая строка события")
+        row = empty[0]
+        self._focus_row(row)
+        combo = row.locator("div.af-dropdown-inner[role=combobox]")
+        field = combo.locator("input.af-tag-input-input:not(.af-tag-input-input-hide)")
+        if field.count():
+            field.first.click()
+            try:
+                field.first.fill(event)
+            except Exception:
+                logger.info("af_event_type_skipped event=%s", event)
+        else:
+            combo.first.click()
+        listed = self._event_option(row, event)
+        if listed is None:
+            self.page.keyboard.press("Escape")
+            if created:
+                self._discard_event_row(row)
+            logger.info("af_event_missing event=%s", event)
+            return "missing"
+        listed.click()
+        root.locator(f'[data-qa-id="selected-option-{event}"]').first.wait_for(state="visible")
+        return "added"
+
+    def _event_option(self, row, event: str):
+        assert self.page is not None
+        scoped = row.locator(f'[role=option]:has([data-title="{event}"])')
+        opened = self.page.locator(f'div.af-dropdown-list[role=listbox] [role=option]:has([data-title="{event}"])')
+        for option in (scoped, opened):
+            try:
+                option.first.wait_for(state="visible", timeout=4000)
+                return option.first
+            except Exception:
+                continue
+        return None
+
+    def _focus_row(self, row) -> None:
         try:
-            self._pick_open_option(label=event)
-        except AfError:
-            search.press("Enter")
-        self.page.locator(f'[data-qa-id="selected-option-{event}"]').wait_for()
+            row.scroll_into_view_if_needed()
+        except Exception:
+            pass
+
+    def _set_agency_sending(self) -> None:
+        assert self.page is not None
+        box = self.page.locator("[data-qa-id=agency-inapp-sending-options]")
+        self._focus("[data-qa-id=agency-inapp-sending-options]")
+        if not box.count():
+            raise AfError("Нет блока Sending option")
+        tag = box.locator(".af-tag-value")
+        if tag.count() and "all media sources" in tag.first.inner_text().lower():
+            return
+        arrow = box.locator(".af-dropdown-input-arrow")
+        if arrow.count():
+            arrow.first.click()
+        else:
+            box.locator(".af-dropdown-inner[role=combobox]").first.click()
+        option = self.page.locator("div.af-dropdown-list[role=listbox] [role=option]").filter(
+            has_text=re.compile(r"All media sources", re.I)
+        )
+        if not option.count():
+            raise AfError("Не нашёл пункт All media sources")
+        option.first.click()
+        self.page.wait_for_function(
+            """() => {
+                const root = document.querySelector('[data-qa-id="agency-inapp-sending-options"]');
+                const value = root && root.querySelector('.af-tag-value');
+                return value && /all media sources/i.test(value.textContent || '');
+            }""",
+            timeout=self.timeout,
+        )
 
     def _read_integration(self) -> IntegrationPage:
         assert self.page is not None
@@ -636,7 +754,7 @@ class PlaywrightAppsFlyer:
         field = root.locator("input[data-qa-id=text-field-input]")
         if field.count():
             return field.first
-        field = root.locator("input[type=text]")
+        field = root.locator("input.af-tag-input-input:not(.af-tag-input-input-hide)")
         if field.count():
             return field.last
         return None
