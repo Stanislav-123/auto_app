@@ -47,11 +47,34 @@ def open_context(pw, *, visible: bool | None = None):
         "viewport": {"width": 1440, "height": 900},
         "args": ["--disable-blink-features=AutomationControlled"],
     }
+    exe = browser_path()
+    if exe:
+        try:
+            return pw.chromium.launch_persistent_context(str(path), executable_path=exe, **args)
+        except Exception as exc:
+            logger.warning("fb_browser_failed path=%s error=%s", exe, str(exc)[:200])
     try:
         return pw.chromium.launch_persistent_context(str(path), channel="chrome", **args)
     except Exception:
         logger.info("fb_chrome_missing fallback=chromium")
         return pw.chromium.launch_persistent_context(str(path), **args)
+
+
+def browser_candidates() -> list[str]:
+    """BROWSER_PATH из .env, иначе Яндекс Браузер в обычных местах Windows."""
+    explicit = (os.getenv("BROWSER_PATH") or "").strip().strip('"')
+    if explicit:
+        return [explicit]
+    tail = Path("Yandex") / "YandexBrowser" / "Application" / "browser.exe"
+    roots = [os.getenv(name) for name in ("LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)")]
+    return [str(Path(root) / tail) for root in roots if root]
+
+
+def browser_path() -> str | None:
+    for candidate in browser_candidates():
+        if Path(candidate).is_file():
+            return candidate
+    return None
 
 
 _ADD_CHILD_RE = re.compile(r"add child|добавить дочерн", re.I)
