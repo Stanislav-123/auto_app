@@ -2,6 +2,7 @@
 __pycache__/
 logs/
 data/
+data/af_state.json
 *.log
 *.pyc
 .venv/

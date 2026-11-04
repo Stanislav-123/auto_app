@@ -44,6 +44,7 @@ _PERSIST_KEYS = {
     "failed_step",
     "failed_error",
     "domain_job",
+    "share_job",
 }
 
 

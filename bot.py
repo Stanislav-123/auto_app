@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,18 @@ from src.crm.zip_assets import safe_upload_filename, safe_zip_filename
 from src.formatter import format_missing_prompt, format_parsed_app, is_parse_complete
 from src.models import ParsedApp, Platform, parsed_from_dict
 from src.parser import merge_missing_reply, parse_app_message
+from src.appsflyer.flow import (
+    begin_share,
+    continue_share,
+    domain_menu_buttons,
+    format_result,
+    help_text,
+    main_menu_buttons,
+    menu_route,
+    share_expects_text,
+    share_menu_buttons,
+)
+from src.appsflyer.session import AfBlocked, AfError, execute_share
 from src.domains.dynadot import DynadotClient
 from src.domains.portal import PortalDomainClient
 from src.domains.pricing import DomainQuote, is_ipv4, parse_domain_list
@@ -97,6 +110,8 @@ RETRY_CALLBACK = "wf:retry"
 PENDING_RESUME_KEY = "pending_resume"
 DOMAIN_JOB_KEY = "domain_job"
 DOMAIN_APP_KEY = "domain-purchase"
+SHARE_JOB_KEY = "share_job"
+SHARE_APP_KEY = "af-share"
 
 CRM_STATUS_ACTIVE = 2
 
@@ -111,7 +126,10 @@ START_TEXT = (
     "Дальше шаги идут сами. Архив, тематику, домен и ключи Facebook "
     "бот попросит отдельно, их можно присылать обычным сообщением.\n\n"
     "Просто пересланный текст без <code>/app</code> завод не запускает.\n\n"
-    "Покупка домена: <code>/domain</code> (Dynadot, Cloudflare, CRM)."
+    "Покупка домена: <code>/domain</code> (Dynadot, Cloudflare, CRM).\n"
+    "Расшарка AppsFlyer: <code>/share_partner</code>, <code>/share_tiktok</code>, "
+    "<code>/share_unity</code>, <code>/share_snapchat</code>.\n"
+    "Кнопки ниже и <code>/menu</code> запускают те же сценарии. Подсказка: <code>/help</code>."
 )
 
 APP_WAIT_TEXT = (
@@ -548,7 +566,29 @@ async def _run_pipeline(update: Update, context: ContextTypes.DEFAULT_TYPE, wf: 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _log_user_action(update, "start")
-    await update.message.reply_text(START_TEXT, parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        START_TEXT,
+        parse_mode=ParseMode.HTML,
+        reply_markup=_button_markup(main_menu_buttons()),
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message:
+        return
+    await message.reply_text(
+        help_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_button_markup(main_menu_buttons()),
+    )
+
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message:
+        return
+    await message.reply_text("Куда идём?", reply_markup=_button_markup(main_menu_buttons()))
 
 
 async def app_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -842,11 +882,21 @@ async def _handle_message_body(update: Update, context: ContextTypes.DEFAULT_TYP
         await _ingest_app_text(update, context, text)
         return
 
+    share = _load_share_job(update, context)
+    domain = _load_domain_job(update, context)
+    share_first = share_expects_text(share) and not (
+        _domain_expects_text(domain)
+        and float((domain or {}).get("started_at") or 0) >= float((share or {}).get("started_at") or 0)
+    )
+    if share_first and share is not None:
+        await _handle_share_text(update, context, share)
+        return
+
     if await _domain_job_wants_text(update, context):
         return
 
     await message.reply_text(
-        "Завод начинается с команды <code>/app</code>.\n"
+        "Завод начинается с команды <code>/app</code> или кнопки в <code>/menu</code>.\n"
         "Пересланное сообщение само по себе ничего не запускает.",
         parse_mode=ParseMode.HTML,
     )
@@ -1472,6 +1522,59 @@ def _domain_default_ip() -> str:
     return os.getenv("DOMAIN_DEFAULT_IP", "5.75.214.90").strip() or "5.75.214.90"
 
 
+def _button_markup(pairs: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=data)] for text, data in pairs])
+
+
+def _new_domain_job() -> dict[str, Any]:
+    return {
+        "stage": "mode",
+        "max_price": _domain_max_price(),
+        "default_ip": _domain_default_ip(),
+        "confirmed": False,
+        "allow_over_limit": False,
+        "quotes": [],
+        "domains": [],
+        "ip": None,
+        "started_at": time.time(),
+    }
+
+
+def _apply_domain_mode(job: dict[str, Any], mode: str) -> str:
+    job["started_at"] = time.time()
+    if mode == "bulk":
+        job["mode"] = "bulk"
+        job["stage"] = "count"
+        return f"Сколько доменов? От 1 до {MAX_BULK}. Только .top и .sbs."
+    if mode == "specific":
+        job["mode"] = "specific"
+        job["stage"] = "names"
+        return "Пришлите точные имена, например backend42.top или несколько через запятую."
+    job["mode"] = "setup"
+    job["stage"] = "names"
+    return (
+        "Пришлите уже купленные домены: столбиком, через запятую или как в таблице. "
+        "Покупать ничего не буду."
+    )
+
+
+def _domain_expects_text(job: dict[str, Any] | None) -> bool:
+    return bool(job) and job.get("stage") in {"count", "names", "ip"}
+
+
+async def _resume_domain_job(update: Update, context: ContextTypes.DEFAULT_TYPE, job: dict[str, Any]) -> None:
+    message = update.effective_message
+    if share_expects_text(_load_share_job(update, context)):
+        _finish_share_job(update, context)
+        if message is not None:
+            await message.reply_text("Ожидание расшарки снял, продолжаю домены.")
+    elif message is not None:
+        await message.reply_text("Продолжаю незавершённую покупку доменов.")
+    job["started_at"] = time.time()
+    _save_domain_job(update, context, job)
+    await _prompt_domain_stage(update, context, job)
+
+
 def _load_domain_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> dict[str, Any] | None:
     current = context.user_data.get(DOMAIN_JOB_KEY)
     if isinstance(current, dict):
@@ -1559,19 +1662,12 @@ async def domain_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         existing = _load_domain_job(update, context)
         if existing and existing.get("stage") not in (None, "done"):
-            await message.reply_text("Продолжаю незавершённую покупку доменов.")
-            await _prompt_domain_stage(update, context, existing)
+            await _resume_domain_job(update, context, existing)
             return
-        job = {
-            "stage": "mode",
-            "max_price": _domain_max_price(),
-            "default_ip": _domain_default_ip(),
-            "confirmed": False,
-            "allow_over_limit": False,
-            "quotes": [],
-            "domains": [],
-            "ip": None,
-        }
+        if share_expects_text(_load_share_job(update, context)):
+            _finish_share_job(update, context)
+            await message.reply_text("Ожидание расшарки снял, открываю домены.")
+        job = _new_domain_job()
         _save_domain_job(update, context, job)
         await message.reply_text(
             "Покупка домена на Dynadot, затем Cloudflare и CRM.\n"
@@ -1859,26 +1955,11 @@ async def handle_domain_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.message.reply_text("Нет активной покупки. Начните с /domain")
             return
         data = query.data
-        if data == "dom:mode:bulk":
-            job["mode"] = "bulk"
-            job["stage"] = "count"
+        if data in {"dom:mode:bulk", "dom:mode:specific", "dom:mode:setup"}:
+            mode = data.rsplit(":", 1)[-1]
+            prompt = _apply_domain_mode(job, mode)
             _save_domain_job(update, context, job)
-            await query.message.reply_text(f"Сколько доменов? От 1 до {MAX_BULK}. Только .top и .sbs.")
-            return
-        if data == "dom:mode:specific":
-            job["mode"] = "specific"
-            job["stage"] = "names"
-            _save_domain_job(update, context, job)
-            await query.message.reply_text("Пришлите точные имена, например backend42.top или несколько через запятую.")
-            return
-        if data == "dom:mode:setup":
-            job["mode"] = "setup"
-            job["stage"] = "names"
-            _save_domain_job(update, context, job)
-            await query.message.reply_text(
-                "Пришлите уже купленные домены: столбиком, через запятую или как в таблице. "
-                "Покупать ничего не буду."
-            )
+            await query.message.reply_text(prompt)
             return
         if data == "dom:over:yes":
             job["allow_over_limit"] = True
@@ -1987,6 +2068,184 @@ async def _execute_domain_purchase(
     await message.reply_text("Готово: домены куплены и заведены в CRM.")
 
 
+def _load_share_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> dict[str, Any] | None:
+    current = context.user_data.get(SHARE_JOB_KEY)
+    if isinstance(current, dict):
+        return current
+    saved = _workflow_store.load(_user_id(update), SHARE_APP_KEY)
+    if saved and isinstance(saved.get("share_job"), dict):
+        context.user_data[SHARE_JOB_KEY] = saved["share_job"]
+        return saved["share_job"]
+    return None
+
+
+def _save_share_job(update: Update, context: ContextTypes.DEFAULT_TYPE, job: dict[str, Any]) -> None:
+    context.user_data[SHARE_JOB_KEY] = job
+    try:
+        _workflow_store.save(_user_id(update), {"app_key": SHARE_APP_KEY, "share_job": job})
+    except Exception:
+        logger.exception("Не удалось сохранить расшарку")
+
+
+def _finish_share_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    job = _load_share_job(update, context) or {"kind": "", "draft": {}}
+    job["stage"] = "done"
+    _save_share_job(update, context, job)
+
+
+async def _send_flow(message, step) -> None:
+    messages = list(step.messages)
+    if not messages:
+        return
+    for text in messages[:-1]:
+        await message.reply_text(text, parse_mode=ParseMode.HTML)
+    markup = _button_markup(step.buttons) if step.buttons else None
+    await message.reply_text(messages[-1], parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def _run_share_task(message, task) -> None:
+    await message.reply_text("Открываю AppsFlyer. По каждому приложению напишу отдельно.")
+    try:
+        results = await asyncio.to_thread(execute_share, task)
+    except AfBlocked as exc:
+        for item in exc.results:
+            await message.reply_text(format_result(item))
+        await message.reply_text(str(exc))
+        return
+    except AfError as exc:
+        await message.reply_text(str(exc))
+        return
+    except Exception as exc:
+        logger.exception("af_share_failed")
+        await message.reply_text(f"Остановка: {exc}")
+        return
+    for item in results:
+        await message.reply_text(format_result(item))
+    if results and all(item.status != "failed" for item in results):
+        await message.reply_text("Расшарка закончена.")
+
+
+async def _start_share(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str) -> None:
+    async def _body() -> None:
+        message = update.effective_message
+        if message is None:
+            return
+        if workflow_reply_kind(_workflow(context)):
+            await message.reply_text("Сначала закончите текущее приложение.")
+            return
+        if _domain_expects_text(_load_domain_job(update, context)):
+            await message.reply_text("Сначала закончите домены: бот ждёт число, имена или IP.")
+            return
+        step = begin_share(kind, message.text or "")
+        _save_share_job(update, context, step.job)
+        await _send_flow(message, step)
+        if step.task:
+            await _run_share_task(message, step.task)
+
+    await _run_locked(update, _body)
+
+
+async def share_partner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _start_share(update, context, "agency")
+
+
+async def share_tiktok_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _start_share(update, context, "tiktok")
+
+
+async def share_unity_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _start_share(update, context, "unity")
+
+
+async def share_snapchat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _start_share(update, context, "snapchat")
+
+
+async def _handle_share_text(update: Update, context: ContextTypes.DEFAULT_TYPE, job: dict[str, Any]) -> None:
+    message = update.message
+    if not message:
+        return
+    text = (message.text or message.caption or "").strip()
+    if not text:
+        await message.reply_text("Пришлите текст: id или приложения.")
+        return
+    step = continue_share(job, text)
+    _save_share_job(update, context, step.job)
+    await _send_flow(message, step)
+    if step.task:
+        await _run_share_task(message, step.task)
+
+
+async def _open_domain_mode(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    if not os.getenv("DYNADOT_API_KEY"):
+        await message.reply_text("Не задан DYNADOT_API_KEY.")
+        return
+    if _get_crm_client() is None:
+        await message.reply_text("CRM не настроена.")
+        return
+    existing = _load_domain_job(update, context)
+    if existing and existing.get("stage") not in (None, "done", "mode"):
+        await _resume_domain_job(update, context, existing)
+        return
+    if share_expects_text(_load_share_job(update, context)):
+        _finish_share_job(update, context)
+        await message.reply_text("Ожидание расшарки снял.")
+    job = _new_domain_job()
+    prompt = _apply_domain_mode(job, mode)
+    _save_domain_job(update, context, job)
+    await message.reply_text(prompt)
+
+
+async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _body() -> None:
+        query = update.callback_query
+        if not query or not query.data:
+            return
+        await query.answer()
+        route = menu_route(query.data)
+        message = query.message
+        if route is None or message is None:
+            return
+        flow = route["flow"]
+        if flow == "app":
+            if share_expects_text(_load_share_job(update, context)):
+                _finish_share_job(update, context)
+            wf = _workflow(context)
+            wf.clear()
+            wf["awaiting_app"] = True
+            await message.reply_text(APP_WAIT_TEXT, parse_mode=ParseMode.HTML)
+            return
+        if flow == "domains":
+            await message.reply_text("Домены.", reply_markup=_button_markup(domain_menu_buttons()))
+            return
+        if flow == "domain":
+            await _open_domain_mode(update, context, route["mode"])
+            return
+        if flow == "share" and "kind" not in route:
+            await message.reply_text("Расшарка AppsFlyer.", reply_markup=_button_markup(share_menu_buttons()))
+            return
+        if flow == "share":
+            if workflow_reply_kind(_workflow(context)):
+                await message.reply_text("Сначала закончите текущее приложение.")
+                return
+            if _domain_expects_text(_load_domain_job(update, context)):
+                await message.reply_text("Сначала закончите домены: бот ждёт число, имена или IP.")
+                return
+            step = begin_share(route["kind"], "")
+            _save_share_job(update, context, step.job)
+            await _send_flow(message, step)
+            return
+        if flow == "cancel":
+            _finish_share_job(update, context)
+            await message.reply_text("Отменил.")
+            return
+
+    await _run_locked(update, _body)
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Необработанная ошибка", exc_info=context.error)
     if not isinstance(update, Update) or update.effective_message is None:
@@ -2013,12 +2272,19 @@ def main() -> None:
     app = Application.builder().token(token).build()
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", start, filters=user_filter))
+    app.add_handler(CommandHandler("help", help_command, filters=user_filter))
+    app.add_handler(CommandHandler("menu", menu_command, filters=user_filter))
     app.add_handler(CommandHandler("app", app_command, filters=user_filter))
     app.add_handler(CommandHandler("domain", domain_command, filters=user_filter))
+    app.add_handler(CommandHandler("share_partner", share_partner_command, filters=user_filter))
+    app.add_handler(CommandHandler("share_tiktok", share_tiktok_command, filters=user_filter))
+    app.add_handler(CommandHandler("share_unity", share_unity_command, filters=user_filter))
+    app.add_handler(CommandHandler("share_snapchat", share_snapchat_command, filters=user_filter))
     app.add_handler(CommandHandler("step2", step2_dev, filters=user_filter))
     app.add_handler(CommandHandler("back_android", back_android_dev, filters=user_filter))
     app.add_handler(AllowedCallbackQueryHandler(handle_step_callback, user_filter, pattern=r"^wf:"))
     app.add_handler(AllowedCallbackQueryHandler(handle_domain_callback, user_filter, pattern=r"^dom:"))
+    app.add_handler(AllowedCallbackQueryHandler(handle_menu_callback, user_filter, pattern=r"^(menu:|share:)"))
     app.add_handler(
         MessageHandler(
             user_filter & (filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,
