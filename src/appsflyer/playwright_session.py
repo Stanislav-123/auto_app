@@ -1008,7 +1008,40 @@ class PlaywrightAppsFlyer:
             if option.count():
                 option.first.click()
                 return
+        if self._pick_menu_option(data_value=data_value, label=label):
+            return
         raise AfError(f"Не нашёл пункт {label or data_value}")
+
+    def _pick_menu_option(self, *, data_value: str | None = None, label: str | None = None) -> bool:
+        """Меню AppsFlyer с поиском: пункты role=button, длинный список виден только после поиска."""
+        assert self.page is not None
+        menu = self.page.locator("[data-qa-id=select-menu__options]").last
+        if not menu.count():
+            return False
+        if self._click_menu_value(menu, data_value, label):
+            return True
+        search = menu.locator("[data-qa-id=search-input] input")
+        if not label or not search.count():
+            return False
+        search.first.fill(label)
+        self.page.wait_for_timeout(500)
+        return self._click_menu_value(menu, data_value, label)
+
+    def _click_menu_value(self, menu, data_value: str | None, label: str | None) -> bool:
+        for value in (data_value, label):
+            if not value:
+                continue
+            option = menu.locator(f'[data-value="{value}"][data-disabled="false"]')
+            if option.count():
+                option.first.click()
+                return True
+        if label:
+            exact = re.compile(rf"^\s*{re.escape(label)}\s*$", re.I)
+            option = menu.locator("[data-qa-id=select-option-value]").filter(has_text=exact)
+            if option.count():
+                option.first.click()
+                return True
+        return False
 
     def _click_switch(self, toggle) -> None:
         if not toggle.count() or toggle.is_checked():
