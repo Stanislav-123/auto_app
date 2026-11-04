@@ -109,3 +109,17 @@ class RtdbTest(unittest.TestCase):
         from src.workflow import persist
 
         self.assertIn("rtdb_done", persist._PERSIST_KEYS)
+
+
+class GoogleClassifyTest(unittest.TestCase):
+    def test_states(self):
+        from src.firebase.google_login import classify
+
+        acc = "https://accounts.google.com/v3/signin/identifier"
+        self.assertEqual(classify("https://console.firebase.google.com/", ""), "console")
+        self.assertEqual(classify(acc, "Sign in", has_email=True), "email")
+        self.assertEqual(classify("https://accounts.google.com/v3/signin/challenge/pwd", "Welcome", has_password=True), "password")
+        self.assertEqual(classify("https://accounts.google.com/v3/signin/challenge/dp", "Check your phone"), "challenge")
+        self.assertEqual(classify(acc, "Couldn't sign you in. This browser or app may not be secure."), "blocked")
+        self.assertEqual(classify(acc, "Wrong password. Try again", has_password=True), "wrong_password")
+        self.assertEqual(classify(acc, "Choose an account"), "chooser")

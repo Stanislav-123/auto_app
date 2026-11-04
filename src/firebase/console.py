@@ -192,8 +192,11 @@ class FirebaseConsole:
             pass
 
     def _require_login(self) -> None:
-        if "accounts.google.com" in (self.page.url or ""):
-            raise FcmKeyError("Нет входа в Google. Запустите python scripts/google_login.py и войдите вручную.")
+        if "accounts.google.com" not in (self.page.url or ""):
+            return
+        from .google_login import sign_in
+
+        sign_in(self.page, CONSOLE, shot=lambda: self._shot("google"))
 
     def _find_project(self, project_id: str | None, name: str | None) -> str | None:
         if project_id:

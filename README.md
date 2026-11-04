@@ -45,7 +45,7 @@ Realtime Database: если в сообщении есть строка `Клю�
 python scripts/google_login.py
 ```
 
-Войти в аккаунт, дождаться консоли Firebase, нажать Enter в терминале. Если Google потом разлогинит — запустить ещё раз. `FB_HEADLESS=0` по умолчанию (Google часто не пускает headless), `FB_TIMEOUT_MS` — таймаут шага.
+Скрипт сам вводит `GOOGLE_EMAIL` и `GOOGLE_PASSWORD` из `.env`. Если Google просит подтверждение на телефоне, ждёт до 2 минут. Если пишет «браузер небезопасен» или показывает капчу — останавливается, скриншот в `logs/google-login.png`. `--manual` — войти руками и нажать Enter. Бот при разлогине тоже входит сам тем же способом. `FB_HEADLESS=0` по умолчанию (Google часто не пускает headless), `FB_TIMEOUT_MS` — таймаут шага.
 
 ## /domain
 
