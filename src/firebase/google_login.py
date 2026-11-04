@@ -31,6 +31,8 @@ _CHALLENGE = (
     "нажмите «да»",
     "open the gmail app",
 )
+EMAIL_INPUT = "#identifierId, input[type=email], input[name=identifier]"
+PASSWORD_INPUT = "input[name=Passwd], input[type=password]:not([name=hiddenPassword])"
 _WRONG_PASSWORD = ("wrong password", "неверный пароль")
 
 
@@ -63,7 +65,7 @@ def sign_in(page, target_url: str, *, wait_2fa_s: int = 120, shot=None) -> None:
     """Довести страницу до консоли. Пароль нигде не логируется."""
     email, password = credentials()
     deadline = time.monotonic() + wait_2fa_s + 60
-    filled_email = filled_password = False
+    email_tries = password_tries = 0
     told_challenge = False
     while time.monotonic() < deadline:
         state = _state(page)
@@ -78,14 +80,20 @@ def sign_in(page, target_url: str, *, wait_2fa_s: int = 120, shot=None) -> None:
             raise FcmKeyError("Нет входа в Google, а GOOGLE_EMAIL/GOOGLE_PASSWORD не заданы.", shot() if shot else None)
         if state == "chooser":
             page.get_by_text(email, exact=False).first.click()
-        elif state == "email" and not filled_email:
-            page.locator("input[type=email]").first.fill(email)
+        elif state == "email":
+            if email_tries >= 3:
+                raise FcmKeyError("Google не принимает почту: после ввода снова просит адрес.", shot() if shot else None)
+            _first_visible(page, EMAIL_INPUT).fill(email)
             _next(page, "#identifierNext")
-            filled_email = True
-        elif state == "password" and not filled_password:
-            page.locator("input[type=password]:visible").first.fill(password)
+            email_tries += 1
+            page.wait_for_timeout(3000)
+        elif state == "password":
+            if password_tries >= 2:
+                raise FcmKeyError("Google снова просит пароль после ввода.", shot() if shot else None)
+            _first_visible(page, PASSWORD_INPUT).fill(password)
             _next(page, "#passwordNext")
-            filled_password = True
+            password_tries += 1
+            page.wait_for_timeout(3000)
         elif state == "challenge" and not told_challenge:
             logger.info("google_challenge waiting=%ss", wait_2fa_s)
             print(f"Google просит подтверждение (2FA). Жду до {wait_2fa_s} секунд, подтвердите на телефоне.", flush=True)
@@ -105,14 +113,24 @@ def _state(page) -> str:
         text = page.inner_text("body")
     except Exception:
         text = ""
-    has_email = _visible(page, "input[type=email]")
-    has_password = _visible(page, "input[type=password]")
+    has_email = _visible(page, EMAIL_INPUT)
+    has_password = _visible(page, PASSWORD_INPUT)
     return classify(page.url or "", text, has_email=has_email, has_password=has_password)
+
+
+def _first_visible(page, selector: str):
+    for item in page.locator(selector).all():
+        try:
+            if item.is_visible():
+                return item
+        except Exception:
+            continue
+    return None
 
 
 def _visible(page, selector: str) -> bool:
     try:
-        return page.locator(f"{selector}:visible").count() > 0
+        return _first_visible(page, selector) is not None
     except Exception:
         return False
 
