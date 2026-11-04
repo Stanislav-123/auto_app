@@ -809,3 +809,13 @@ class SearchMenuTest(unittest.TestCase):
         session.page = _FakeMenuPage()
         self.assertTrue(session._pick_menu_option(label="LaunchAPP"))
         self.assertEqual(session.page.visible, ["Pay", "LaunchAPP"])
+
+
+class ValuesRevenueLabelTest(unittest.TestCase):
+    def test_no_values_label_is_not_values_and_revenue(self):
+        from src.appsflyer.plan import values_and_revenue
+
+        self.assertFalse(values_and_revenue("No values & no revenue"))
+        self.assertFalse(values_and_revenue("Values & no revenue"))
+        self.assertTrue(values_and_revenue("Values & revenue"))
+        self.assertTrue(values_and_revenue("all"))

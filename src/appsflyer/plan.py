@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 
 from dataclasses import dataclass, field
 
@@ -100,7 +101,11 @@ def values_and_revenue(value: str | None) -> bool:
     text = (value or "").strip().lower()
     if not text:
         return False
-    return text == "all" or ("value" in text and "revenue" in text)
+    if text == "all":
+        return True
+    if re.search(r"\bno\b", text) or text in {"nothing", "without-revenue"}:
+        return False
+    return "value" in text and "revenue" in text
 
 
 # Мастер, затем подтумблеры. Add validation rules только после View.
