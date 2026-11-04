@@ -744,3 +744,68 @@ class TestAppIdField(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FakeLoc:
+    def __init__(self, menu, sel):
+        self.menu, self.sel = menu, sel
+
+    @property
+    def first(self):
+        return self
+
+    @property
+    def last(self):
+        return self
+
+    def count(self):
+        if self.sel == "menu":
+            return 1
+        if self.sel == "search":
+            return 1
+        if self.sel.startswith("value:"):
+            return 1 if self.sel[6:] in self.menu.visible else 0
+        return 0
+
+    def locator(self, sel):
+        if "search-input" in sel:
+            return _FakeLoc(self.menu, "search")
+        if sel.startswith("[data-value="):
+            return _FakeLoc(self.menu, "value:" + sel.split('"')[1])
+        return _FakeLoc(self.menu, "none")
+
+    def filter(self, **_):
+        return _FakeLoc(self.menu, "none")
+
+    def fill(self, text):
+        self.menu.visible = [v for v in self.menu.all if text.lower() in v.lower()]
+
+    def click(self):
+        self.menu.clicked = self.sel[6:]
+
+
+class _FakeMenuPage:
+    def __init__(self):
+        self.all = ["Pay", "LaunchAPP", "Registration", "Purchase"]
+        self.visible = ["Pay", "LaunchAPP"]
+        self.clicked = None
+
+    def locator(self, sel):
+        return _FakeLoc(self, "menu")
+
+    def wait_for_timeout(self, _):
+        pass
+
+
+class SearchMenuTest(unittest.TestCase):
+    def test_searches_when_option_hidden(self):
+        session = PlaywrightAppsFlyer("user@example.com", "secret-pass")
+        session.page = _FakeMenuPage()
+        self.assertTrue(session._pick_menu_option(label="Purchase"))
+        self.assertEqual(session.page.clicked, "Purchase")
+
+    def test_visible_option_without_search(self):
+        session = PlaywrightAppsFlyer("user@example.com", "secret-pass")
+        session.page = _FakeMenuPage()
+        self.assertTrue(session._pick_menu_option(label="LaunchAPP"))
+        self.assertEqual(session.page.visible, ["Pay", "LaunchAPP"])
