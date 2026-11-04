@@ -6,6 +6,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from src.appsflyer.agency import drive_agency
 from src.appsflyer.plan import (
     PARTNER_IDS,
     AgencyPage,
@@ -42,6 +43,113 @@ _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+
+
+def _toggle_selector(qa_id: str) -> str:
+    return f'div.af-toggle-inner[role=checkbox][data-qa-id="{qa_id}"]'
+
+
+class _AgencyPage:
+    """Живая страница Permissions. Подтумблеры появляются после мастера."""
+
+    def __init__(self, session: PlaywrightAppsFlyer) -> None:
+        self.session = session
+
+    def ids(self) -> list[str]:
+        assert self.session.page is not None
+        nodes = self.session.page.locator("div.af-toggle-inner[role=checkbox]")
+        found = []
+        for index in range(nodes.count()):
+            qa_id = nodes.nth(index).get_attribute("data-qa-id")
+            if qa_id:
+                found.append(qa_id)
+        return found
+
+    def has(self, qa_id: str) -> bool:
+        assert self.session.page is not None
+        return self.session.page.locator(_toggle_selector(qa_id)).count() > 0
+
+    def checked(self, qa_id: str) -> bool:
+        assert self.session.page is not None
+        item = self.session.page.locator(_toggle_selector(qa_id))
+        if not item.count():
+            return False
+        return (item.first.get_attribute("aria-checked") or "").lower() == "true"
+
+    def wait_subs(self) -> None:
+        assert self.session.page is not None
+        self.session.page.wait_for_function(
+            """() => {
+                const nodes = [...document.querySelectorAll('div.af-toggle-inner[role=checkbox]')];
+                return nodes.some((node) => {
+                    const id = node.getAttribute('data-qa-id');
+                    return id && id !== 'AgencyPermissions' && node.getAttribute('aria-disabled') !== 'true';
+                });
+            }""",
+            timeout=self.session.timeout,
+        )
+
+    def wait_enabled(self, qa_id: str) -> None:
+        assert self.session.page is not None
+        self.session._focus(_toggle_selector(qa_id))
+        self.session.page.wait_for_function(
+            """(id) => {
+                const node = document.querySelector(`div.af-toggle-inner[role=checkbox][data-qa-id="${id}"]`);
+                return node && node.getAttribute('aria-disabled') !== 'true';
+            }""",
+            arg=qa_id,
+            timeout=self.session.timeout,
+        )
+
+    def wait_has(self, qa_id: str) -> None:
+        assert self.session.page is not None
+        self.session.page.locator(_toggle_selector(qa_id)).first.wait_for(state="visible", timeout=self.session.timeout)
+
+    def click(self, qa_id: str) -> None:
+        assert self.session.page is not None
+        self.session._focus(_toggle_selector(qa_id))
+        item = self.session.page.locator(_toggle_selector(qa_id)).first
+        item.click()
+
+    def focus(self, qa_id: str) -> None:
+        self.session._focus(_toggle_selector(qa_id))
+
+    def wait_add_event(self) -> None:
+        assert self.session.page is not None
+        self.session._focus('[data-qa-id="add-event"]')
+        self.session.page.locator('[data-qa-id="add-event"]').first.wait_for(
+            state="visible",
+            timeout=self.session.timeout,
+        )
+
+    def known_events(self) -> list[str]:
+        assert self.session.page is not None
+        found = []
+        for name in ("af_app_opened", "af_complete_registration", "af_purchase"):
+            if self.session.page.locator(f'[data-qa-id="selected-option-{name}"]').count():
+                found.append(name)
+        return found
+
+    def add_event(self, name: str) -> None:
+        self.session._add_agency_event(name)
+
+    def sending(self) -> str:
+        assert self.session.page is not None
+        box = self.session.page.locator('[data-qa-id="agency-inapp-sending-options"]')
+        if not box.count():
+            return ""
+        button = box.locator("button[data-qa-id=select-button]")
+        if not button.count():
+            return box.inner_text()
+        return button.first.get_attribute("data-value") or button.first.inner_text()
+
+    def set_sending(self) -> None:
+        self.session._focus('[data-qa-id="agency-inapp-sending-options"]')
+        self.session._choose(
+            "agency-inapp-sending-options",
+            data_value="send-all",
+            label="All media sources, including organic",
+        )
 
 
 class PlaywrightAppsFlyer:
@@ -136,6 +244,11 @@ class PlaywrightAppsFlyer:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         path = self.log_dir / f"af-{safe_filename(kind)}-{safe_filename(app)}-{stamp}.png"
         try:
+            focus = getattr(self, "_focus_selector", None)
+            if focus:
+                target = self.page.locator(focus)
+                if target.count():
+                    target.first.scroll_into_view_if_needed()
             self.page.screenshot(path=str(path), full_page=True)
         except Exception as exc:
             logger.warning("af_screenshot_failed app=%s error=%s", app, exc)
@@ -410,18 +523,24 @@ class PlaywrightAppsFlyer:
         )
 
     def _apply_agency(self, plan: AgencyPlan) -> None:
-        for key in plan.turn_on:
-            self._turn_on(f'div.af-toggle-inner[role=checkbox][data-qa-id="{key}"]')
-        for event in plan.add_events:
-            self._add_agency_event(event)
-        if plan.set_sending:
-            self._choose("agency-inapp-sending-options", data_value="send-all", label="All media sources, including organic")
+        del plan
+        drive_agency(_AgencyPage(self))
+
+    def _focus(self, selector: str) -> None:
+        self._focus_selector = selector
+        assert self.page is not None
+        target = self.page.locator(selector)
+        if target.count():
+            target.first.scroll_into_view_if_needed()
 
     def _add_agency_event(self, event: str) -> None:
         assert self.page is not None
         if self.page.locator(f'[data-qa-id="selected-option-{event}"]').count():
             return
-        self.page.locator('[data-qa-id="add-event"]').click()
+        self._focus('[data-qa-id="add-event"]')
+        button = self.page.locator('[data-qa-id="add-event"]')
+        button.first.wait_for(state="visible")
+        button.first.click()
         search = self.page.locator("input[role=combobox], [role=listbox] input, input[type=text]").last
         search.click()
         search.fill(event)
@@ -676,13 +795,6 @@ class PlaywrightAppsFlyer:
                 return
         raise AfError(f"Не нашёл пункт {label or data_value}")
 
-    def _turn_on(self, selector: str) -> None:
-        assert self.page is not None
-        item = self.page.locator(selector).first
-        if (item.get_attribute("aria-checked") or "").lower() == "true":
-            return
-        item.click()
-
     def _click_switch(self, toggle) -> None:
         if not toggle.count() or toggle.is_checked():
             return
@@ -695,6 +807,7 @@ class PlaywrightAppsFlyer:
     def _save_and_confirm(self) -> None:
         assert self.page is not None
         button = self.page.locator("[data-qa-id=save-tab-changes-btn]")
+        self._focus("[data-qa-id=save-tab-changes-btn]")
         if not button.count():
             raise AfError("Нет кнопки сохранения.")
         if button.first.is_disabled():
