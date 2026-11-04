@@ -145,3 +145,27 @@ class BrowserPathTest(unittest.TestCase):
                 self.assertTrue(any("YandexBrowser" in c for c in browser_candidates()))
         finally:
             os.unlink(exe)
+
+
+class LivePageTest(unittest.TestCase):
+    def test_switches_to_open_tab_or_fails(self):
+        from src.firebase.google_login import _live_page
+        from src.firebase.key import FcmKeyError
+
+        class P:
+            def __init__(self, closed, ctx=None):
+                self.closed, self.context = closed, ctx
+
+            def is_closed(self):
+                return self.closed
+
+        class C:
+            pages = []
+
+        ctx = C()
+        old, new = P(True, ctx), P(False, ctx)
+        ctx.pages = [old, new]
+        self.assertIs(_live_page(old), new)
+        ctx.pages = [old]
+        with self.assertRaises(FcmKeyError):
+            _live_page(old)

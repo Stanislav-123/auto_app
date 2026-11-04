@@ -30,6 +30,8 @@ _CHALLENGE = (
     "tap yes",
     "нажмите «да»",
     "open the gmail app",
+    "enter a phone number",
+    "введите номер телефона",
 )
 EMAIL_INPUT = "#identifierId, input[type=email], input[name=identifier]"
 PASSWORD_INPUT = "input[name=Passwd], input[type=password]:not([name=hiddenPassword])"
@@ -68,6 +70,7 @@ def sign_in(page, target_url: str, *, wait_2fa_s: int = 120, shot=None) -> None:
     email_tries = password_tries = 0
     told_challenge = False
     while time.monotonic() < deadline:
+        page = _live_page(page)
         state = _state(page)
         if state == "console":
             logger.info("google_signed_in")
@@ -106,8 +109,22 @@ def sign_in(page, target_url: str, *, wait_2fa_s: int = 120, shot=None) -> None:
                 page.goto(target_url, wait_until="domcontentloaded")
             except Exception:
                 pass
-        page.wait_for_timeout(2000)
+        try:
+            page.wait_for_timeout(2000)
+        except Exception:
+            if not page.is_closed():
+                raise
     raise FcmKeyError("Не дождался входа в Google (2FA не подтвердили или страница зависла).", shot() if shot else None)
+
+
+def _live_page(page):
+    """Браузер мог закрыть вкладку и открыть новую — берём последнюю живую."""
+    if not page.is_closed():
+        return page
+    pages = [item for item in page.context.pages if not item.is_closed()]
+    if not pages:
+        raise FcmKeyError("Окно браузера закрылось до входа в Google.")
+    return pages[-1]
 
 
 def _state(page) -> str:
