@@ -123,3 +123,25 @@ class GoogleClassifyTest(unittest.TestCase):
         self.assertEqual(classify(acc, "Couldn't sign you in. This browser or app may not be secure."), "blocked")
         self.assertEqual(classify(acc, "Wrong password. Try again", has_password=True), "wrong_password")
         self.assertEqual(classify(acc, "Choose an account"), "chooser")
+
+
+class BrowserPathTest(unittest.TestCase):
+    def test_env_path_wins_and_missing_is_none(self):
+        import os
+        import tempfile
+        from unittest import mock
+
+        from src.firebase.console import browser_candidates, browser_path
+
+        with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as handle:
+            exe = handle.name
+        try:
+            with mock.patch.dict(os.environ, {"BROWSER_PATH": exe}):
+                self.assertEqual(browser_candidates(), [exe])
+                self.assertEqual(browser_path(), exe)
+            with mock.patch.dict(os.environ, {"BROWSER_PATH": exe + ".nope"}):
+                self.assertIsNone(browser_path())
+            with mock.patch.dict(os.environ, {"BROWSER_PATH": "", "LOCALAPPDATA": "/tmp/x"}):
+                self.assertTrue(any("YandexBrowser" in c for c in browser_candidates()))
+        finally:
+            os.unlink(exe)

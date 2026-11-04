@@ -83,15 +83,17 @@ def sign_in(page, target_url: str, *, wait_2fa_s: int = 120, shot=None) -> None:
         elif state == "email":
             if email_tries >= 3:
                 raise FcmKeyError("Google не принимает почту: после ввода снова просит адрес.", shot() if shot else None)
-            _first_visible(page, EMAIL_INPUT).fill(email)
-            _next(page, "#identifierNext")
+            field = _first_visible(page, EMAIL_INPUT)
+            field.fill(email)
+            _next(page, field)
             email_tries += 1
             page.wait_for_timeout(3000)
         elif state == "password":
             if password_tries >= 2:
                 raise FcmKeyError("Google снова просит пароль после ввода.", shot() if shot else None)
-            _first_visible(page, PASSWORD_INPUT).fill(password)
-            _next(page, "#passwordNext")
+            field = _first_visible(page, PASSWORD_INPUT)
+            field.fill(password)
+            _next(page, field)
             password_tries += 1
             page.wait_for_timeout(3000)
         elif state == "challenge" and not told_challenge:
@@ -135,9 +137,6 @@ def _visible(page, selector: str) -> bool:
         return False
 
 
-def _next(page, selector: str) -> None:
-    button = page.locator(selector)
-    if button.count():
-        button.first.click()
-        return
-    page.get_by_role("button", name=re.compile(r"^(next|далее)$", re.I)).first.click()
+def _next(page, field) -> None:
+    """Enter в поле: кнопку «Далее» у Google часто перекрывает прозрачный слой."""
+    field.press("Enter")
