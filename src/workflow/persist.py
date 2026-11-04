@@ -32,6 +32,8 @@ _PERSIST_KEYS = {
     "crm_collecting",
     "crm_stage",
     "crm_needs_apns",
+    "fcm_key",
+    "rtdb_done",
     "crm_zip_done",
     "crm_awaiting_theme",
     "crm_theme_id",

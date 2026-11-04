@@ -206,6 +206,7 @@ def create_crm_app(
                     banner_appcraft=files.get("banner_appcraft"),
                     slider=files.get("slider"),
                     apns_key=files.get("apns"),
+                    fcm_key=wf.get("fcm_key"),
                     apps_status=CRM_STATUS_ACTIVE,
                     apps_created_by=created_by,
                     theme_id=theme_id,

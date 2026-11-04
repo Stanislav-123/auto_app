@@ -17,6 +17,7 @@ FIELD_LABELS: dict[str, str] = {
     "developer_site": "Сайт разработчика",
     "backend": "Backend",
     "firebase_name": "Название в Firebase",
+    "firebase_keys": "Ключи firebase",
 }
 
 PLATFORM_EMOJI = {
@@ -56,7 +57,7 @@ def format_parsed_app(app: ParsedApp) -> str:
     elif app.platform == Platform.ANDROID:
         field_order = [
             "name", "store_url", "store_id", "bundle",
-            "appsflyer", "firebase_name", "owner",
+            "appsflyer", "firebase_name", "firebase_keys", "owner",
         ]
     else:
         field_order = list(FIELD_LABELS.keys())

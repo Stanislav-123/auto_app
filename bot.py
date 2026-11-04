@@ -73,6 +73,8 @@ from src.domains.setup import (
     search_specific,
     select_for_purchase,
 )
+from src.firebase.console import setup_firebase
+from src.firebase.key import describe_key, parse_service_account, rtdb_values, split_firebase_keys
 from src.workflow.intake import extract_app_command_payload, workflow_reply_kind
 from src.workflow.locks import user_lock
 from src.workflow.logging_setup import setup_logging
@@ -190,6 +192,7 @@ def _parsed_from_dict(data: dict) -> ParsedApp:
         developer_site=data.get("developer_site"),
         backend=data.get("backend"),
         firebase_name=data.get("firebase_name"),
+        firebase_keys=data.get("firebase_keys"),
         raw_text=data.get("raw_text", ""),
         missing_fields=data.get("missing_fields", []),
     )
@@ -1196,6 +1199,9 @@ async def _handle_crm_file_message(
         if stage == "apns":
             await _process_crm_apns(message, context, wf, files, temp_dir)
             return
+        if stage == "fcm":
+            await _process_crm_fcm(message, context, wf, temp_dir)
+            return
     except ValueError as exc:
         _log_user_action(update, "crm_file_error", error=str(exc))
         await _notify_error(message, str(exc))
@@ -1234,6 +1240,11 @@ async def _process_crm_zip(
         archive=filename,
     )
 
+    parsed_now = _parsed_from_dict(wf["parsed"])
+    if parsed_now.platform != Platform.IOS:
+        await _collect_fcm(message, context, wf)
+        return
+
     if wf.get("crm_needs_apns"):
         wf["crm_stage"] = "apns"
         await message.reply_text(
@@ -1268,6 +1279,110 @@ async def _process_crm_apns(
     files["apns"] = parse_apns_key_file(content, filename)
 
     _log_user_action(message, "crm_apns_received", filename=filename)
+    await _ask_crm_theme(message, wf)
+
+
+async def _collect_fcm(message, context: ContextTypes.DEFAULT_TYPE, wf: dict[str, Any]) -> None:
+    """Android: ключ FCM и значения в Realtime Database через Firebase console.
+    Уже сделанное второй раз не делаем: ключ лежит в workflow, база помечена rtdb_done."""
+    parsed = _parsed_from_dict(wf["parsed"])
+    need_key = not wf.get("fcm_key")
+    rtdb = None
+    rtdb_note = ""
+    keys = split_firebase_keys(parsed.firebase_keys)
+    if keys and not wf.get("rtdb_done"):
+        domain = resolve_domain(wf)
+        try:
+            if not domain:
+                raise ValueError("домена ещё нет")
+            rtdb = rtdb_values(keys, domain)
+        except ValueError as exc:
+            rtdb_note = f"Ключи firebase не заполнены: {exc}."
+    if wf.get("fcm_key"):
+        await message.reply_text(f"FCM ключ уже есть: {describe_key(wf['fcm_key'])}")
+    if rtdb_note:
+        await message.reply_text(rtdb_note)
+    if not need_key and not rtdb:
+        await _ask_crm_theme(message, wf)
+        return
+    await message.reply_text("Захожу в Firebase…")
+    try:
+        result = await asyncio.to_thread(setup_firebase, parsed.firebase_name, need_key=need_key, rtdb=rtdb)
+    except Exception as exc:
+        reason = str(exc) or exc.__class__.__name__
+        shot = getattr(exc, "screenshot", None)
+        logger.warning("firebase_auto_failed reason=%s", reason)
+        if rtdb:
+            await _report_rtdb_manual(message, rtdb, reason, None if need_key else shot)
+        if need_key:
+            await _ask_fcm_file(message, context, wf, reason, shot)
+        else:
+            await _ask_crm_theme(message, wf)
+        return
+    if result.key:
+        wf["fcm_key"] = result.key
+        _log_user_action(message, "crm_fcm_generated", account=result.key.get("client_email"))
+        await message.reply_text(f"✅ FCM ключ получен: {describe_key(result.key)}")
+    if rtdb:
+        if result.rtdb in {"done", "already"}:
+            wf["rtdb_done"] = True
+            pairs = ", ".join(f"{k} = {v}" for k, v in rtdb.items())
+            word = "уже стояли" if result.rtdb == "already" else "записаны"
+            await message.reply_text(f"✅ Realtime Database: {pairs} ({word})")
+        else:
+            await _report_rtdb_manual(message, rtdb, result.rtdb_error, result.rtdb_screenshot)
+    _persist_wf_message(message, context)
+    await _ask_crm_theme(message, wf)
+
+
+async def _report_rtdb_manual(message, rtdb: dict[str, str], reason: str, shot: str | None) -> None:
+    if shot and Path(shot).exists():
+        try:
+            with open(shot, "rb") as handle:
+                await message.reply_photo(handle, caption="Realtime Database")
+        except Exception:
+            logger.warning("rtdb_screenshot_send_failed")
+    pairs = "\n".join(f"<code>{escape(k)}</code> = <code>{escape(v)}</code>" for k, v in rtdb.items())
+    await message.reply_text(
+        f"Не получилось заполнить Realtime Database: {escape(reason)}\n\nПоставьте вручную:\n{pairs}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _ask_fcm_file(message, context, wf: dict[str, Any], reason: str, shot: str | None) -> None:
+    wf["crm_stage"] = "fcm"
+    _persist_wf_message(message, context)
+    if shot and Path(shot).exists():
+        try:
+            with open(shot, "rb") as handle:
+                await message.reply_photo(handle, caption="Firebase")
+        except Exception:
+            logger.warning("fcm_screenshot_send_failed")
+    await message.reply_text(
+        f"Не получилось взять FCM ключ автоматически: {escape(reason)}\n\n"
+        "Отправьте <b>JSON-файл сервисного аккаунта Firebase</b> "
+        "(Project settings → Service accounts → Generate new private key).",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _process_crm_fcm(message, context, wf: dict[str, Any], temp_dir: Path) -> None:
+    document = message.document
+    if not document:
+        await _notify_error(message, "Отправьте FCM JSON-файл как документ.")
+        return
+    filename = safe_upload_filename(document.file_name, "fcm.json")
+    target = temp_dir / filename
+    telegram_file = await context.bot.get_file(document.file_id)
+    await telegram_file.download_to_drive(custom_path=str(target))
+    try:
+        data = parse_service_account(target.read_bytes())
+    finally:
+        target.unlink(missing_ok=True)
+    wf["fcm_key"] = data
+    _persist_wf_message(message, context)
+    _log_user_action(message, "crm_fcm_received", account=data.get("client_email"))
+    await message.reply_text(f"✅ FCM ключ принят: {describe_key(data)}")
     await _ask_crm_theme(message, wf)
 
 

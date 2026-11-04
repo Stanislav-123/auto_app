@@ -5,6 +5,7 @@ import re
 from typing import Any, Optional
 
 from src.models import ParsedApp, Platform
+from src.firebase.key import fcm_key_string
 
 CRM_PLATFORM_IOS = 1
 CRM_PLATFORM_ANDROID = 0
@@ -49,6 +50,7 @@ def build_create_app_payload(
     banner_appcraft: Optional[str] = None,
     slider: Optional[str] = None,
     apns_key: Optional[dict[str, str]] = None,
+    fcm_key: Optional[dict[str, Any]] = None,
     apps_status: int = 2,
     apps_created_by: Optional[str] = None,
     theme_id: Optional[int | str] = None,
@@ -91,7 +93,7 @@ def build_create_app_payload(
         "apps_general_application": apps_general_application,
         "apps_in_house_general": apps_in_house_general,
         "apps_link_status": 1 if parsed.platform == Platform.IOS else 0,
-        "fcm_key": "0",
+        "fcm_key": fcm_key_string(fcm_key) if parsed.platform != Platform.IOS else "0",
         "apns_key": 0,
         "is_appsflyer": bool(parsed.appsflyer),
         "is_private": 1 if is_private else 0,
