@@ -9,7 +9,7 @@ from .models import ParsedApp, Platform
 # --- URL patterns ---
 
 IOS_STORE_URL_RE = re.compile(
-    r"https?://apps\.apple\.com/[^\s]+/id(\d+)",
+    r"https?://(?:apps|itunes)\.apple\.com/[^\s]+/id(\d+)",
     re.IGNORECASE,
 )
 ANDROID_STORE_URL_RE = re.compile(

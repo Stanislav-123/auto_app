@@ -63,11 +63,11 @@ playwright install chromium
 
 Так и на Windows, и на Linux.
 
-Приложения можно присылать bundle или ссылкой Google Play, несколько сразу: с новой строки, через пробел или запятую. Ответ по каждому: готово / уже настроено / ошибка. Одно приложение не роняет остальные. Если на странице 2FA или капча, бот останавливается и пишет об этом. Скриншот ошибки лежит в `logs/`.
+Приложения — Android или iOS, несколько сразу: с новой строки, через пробел или запятую. Android: bundle или ссылка Google Play. iOS: ссылка App Store (`apps.apple.com`, любая страна, можно с query) или iTunes (`itunes.apple.com`), `id1234567890` или 9–12 цифр. В кабинет уходит `id` с префиксом. Ответ по каждому: готово / уже настроено / ошибка. Одно приложение не роняет остальные. Если на странице 2FA или капча, бот останавливается и пишет об этом. Скриншот ошибки лежит в `logs/`. На iOS баннер может говорить про IDFA вместо GAID — бот его не ждёт и идёт по тем же полям.
 
 - `/share_partner <id или ссылка партнёра> <приложения>` — вкладка Permissions: все тумблеры, включая Send events revenue, события `af_app_opened`, `af_complete_registration`, `af_purchase`, отправка All media sources, including organic.
 - `/share_tiktok <TikTok App ID...> <приложения>` — `tiktokglobal_int`. Включает интеграцию, дописывает id без дублей, события LaunchAPP / Registration / Purchase, send-all и Values & revenue.
-- `/share_unity <game id> <приложение>` — `unityads_int`. Несколько приложений: пара game id и bundle в каждой строке, или один game id и список приложений. Game id пишется в General settings и во второе поле In-app event settings. События session / level_complete / purchase. После сохранения бот присылает click и impression ссылки.
+- `/share_unity <game id> <приложение>` — `unityads_int`. Несколько приложений: пара game id и приложение в каждой строке, или один game id и список приложений (Android или iOS). Game id пишется в General settings и во второе поле In-app event settings. События session / level_complete / purchase. После сохранения бот присылает click и impression ссылки.
 - `/share_snapchat <Snap App ID...> <приложения>` — `snapchat_int`, события APP_OPEN / SIGN_UP / PURCHASE.
 
 Если партнёр ещё не подключён к приложению, бот пробует открыть прямую страницу и кнопку Integrate. Этот экран на живом кабинете не снимался: если его нет, в чат уйдёт ошибка и скриншот, чужие настройки бот не трогает.

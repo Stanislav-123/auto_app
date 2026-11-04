@@ -8,6 +8,9 @@ BUNDLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$")
 PARTNER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{2,63}$")
 TIKTOK_ID_RE = re.compile(r"^\d{16,20}$")
 UNITY_GAME_RE = re.compile(r"^\d{4,14}$")
+IOS_DIGITS_RE = re.compile(r"^\d{9,12}$")
+IOS_PREFIX_RE = re.compile(r"^id(\d{9,12})$", re.IGNORECASE)
+APPLE_HOSTS = ("apps.apple.com", "itunes.apple.com")
 SNAP_ID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -49,21 +52,31 @@ def tokenize(text: str) -> list[str]:
 
 
 def bundle_from_token(token: str) -> str | None:
+    """Android bundle или ссылка Google Play. iOS сюда не входит."""
     raw = (token or "").strip().strip("<>")
     if not raw:
         return None
     if raw.lower().startswith(("http://", "https://")):
-        parsed = urllib.parse.urlparse(raw)
-        host = (parsed.netloc or "").lower()
-        if "play.google.com" not in host:
-            return None
-        found = urllib.parse.parse_qs(parsed.query).get("id") or []
-        candidate = found[0] if found else ""
-        if BUNDLE_RE.match(candidate):
-            return candidate
-        return None
+        return _android_from_url(raw)
     if BUNDLE_RE.match(raw):
         return raw
+    return None
+
+
+def app_from_token(token: str, *, bare_number: bool = True) -> str | None:
+    """Android bundle или iOS id вида id1234567890."""
+    raw = (token or "").strip().strip("<>")
+    if not raw:
+        return None
+    if raw.lower().startswith(("http://", "https://")):
+        return _android_from_url(raw) or _ios_from_url(raw)
+    if BUNDLE_RE.match(raw):
+        return raw
+    prefixed = IOS_PREFIX_RE.match(raw)
+    if prefixed:
+        return f"id{prefixed.group(1)}"
+    if bare_number and IOS_DIGITS_RE.match(raw):
+        return f"id{raw}"
     return None
 
 
@@ -75,7 +88,7 @@ def partner_from_token(token: str) -> str | None:
         path = [part for part in urllib.parse.urlparse(raw).path.split("/") if part]
         if "integrated-partners" in path:
             tail = path[path.index("integrated-partners") + 1 :]
-            if len(tail) >= 2 and bundle_from_token(tail[0]):
+            if len(tail) >= 2 and app_from_token(tail[0], bare_number=False):
                 return _clean_partner(tail[1])
             if tail:
                 return _clean_partner(tail[0])
@@ -84,7 +97,7 @@ def partner_from_token(token: str) -> str | None:
             if tail:
                 return _clean_partner(tail[0])
         return None
-    if bundle_from_token(raw):
+    if app_from_token(raw):
         return None
     if PARTNER_RE.match(raw):
         return raw
@@ -95,11 +108,11 @@ def parse_apps(text: str) -> list[str]:
     apps: list[str] = []
     seen: set[str] = set()
     for token in tokenize(text):
-        bundle = bundle_from_token(token)
-        if not bundle or bundle in seen:
+        app = app_from_token(token)
+        if not app or app in seen:
             continue
-        seen.add(bundle)
-        apps.append(bundle)
+        seen.add(app)
+        apps.append(app)
     return apps
 
 
@@ -127,11 +140,11 @@ def _parse_agency(body: str) -> ParsedShare:
     apps: list[str] = []
     seen: set[str] = set()
     for token in tokens[1:]:
-        bundle = bundle_from_token(token)
-        if bundle:
-            if bundle not in seen:
-                seen.add(bundle)
-                apps.append(bundle)
+        app = app_from_token(token)
+        if app:
+            if app not in seen:
+                seen.add(app)
+                apps.append(app)
             continue
         unknown.append(token)
     if unknown:
@@ -150,11 +163,11 @@ def _parse_tagged(body: str, pattern: re.Pattern[str], title: str, *, lower: boo
     seen_ids: set[str] = set()
     seen_apps: set[str] = set()
     for token in tokenize(body):
-        bundle = bundle_from_token(token)
-        if bundle:
-            if bundle not in seen_apps:
-                seen_apps.add(bundle)
-                apps.append(bundle)
+        app = app_from_token(token)
+        if app:
+            if app not in seen_apps:
+                seen_apps.add(app)
+                apps.append(app)
             continue
         value = token.lower() if lower else token
         if pattern.match(value):
@@ -193,27 +206,45 @@ def _parse_unity(body: str) -> ParsedShare:
         pairs.append((app, game))
 
     for line in [item.strip() for item in body.splitlines() if item.strip()]:
-        ids: list[str] = []
-        apps: list[str] = []
+        explicit: list[str] = []
+        ambiguous: list[str] = []
+        games: list[str] = []
         for token in tokenize(line):
-            bundle = bundle_from_token(token)
-            if bundle:
-                apps.append(bundle)
+            app = app_from_token(token, bare_number=False)
+            if app:
+                explicit.append(app)
+                continue
+            if IOS_DIGITS_RE.match(token):
+                ambiguous.append(token)
                 continue
             if UNITY_GAME_RE.match(token) and not TIKTOK_ID_RE.match(token):
-                ids.append(token)
+                games.append(token)
                 continue
             unknown.append(token)
         if unknown:
             raise ParseError("Не разобрал: " + ", ".join(unknown))
-        if len(ids) > 1:
+        if len(games) > 1:
             raise ParseError("В строке Unity должен быть один game id.")
-        if len(ids) == 1 and apps:
+        game: str | None = games[0] if games else None
+        apps = list(explicit)
+        if game:
+            apps.extend(f"id{item}" for item in ambiguous)
+        elif explicit or len(ambiguous) > 1:
+            if not ambiguous:
+                pass
+            else:
+                game = ambiguous[0]
+                apps.extend(f"id{item}" for item in ambiguous[1:])
+        elif len(ambiguous) == 1 and default_game:
+            apps.append(f"id{ambiguous[0]}")
+        elif len(ambiguous) == 1:
+            game = ambiguous[0]
+        if game and apps:
             for app in apps:
-                take_app(app, ids[0])
+                take_app(app, game)
             continue
-        if len(ids) == 1:
-            default_game = ids[0]
+        if game:
+            default_game = game
             for app in pending:
                 take_app(app, default_game)
             pending = []
@@ -230,6 +261,31 @@ def _parse_unity(body: str) -> ParsedShare:
     if not pairs:
         return ParsedShare(missing="pairs", default_game=default_game)
     return ParsedShare(pairs=pairs, default_game=default_game)
+
+
+def _android_from_url(raw: str) -> str | None:
+    parsed = urllib.parse.urlparse(raw)
+    host = (parsed.netloc or "").lower()
+    if "play.google.com" not in host:
+        return None
+    found = urllib.parse.parse_qs(parsed.query).get("id") or []
+    candidate = found[0] if found else ""
+    if BUNDLE_RE.match(candidate):
+        return candidate
+    return None
+
+
+def _ios_from_url(raw: str) -> str | None:
+    parsed = urllib.parse.urlparse(raw)
+    host = (parsed.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host not in APPLE_HOSTS:
+        return None
+    match = re.search(r"/id(\d+)", parsed.path, re.IGNORECASE)
+    if not match:
+        return None
+    return f"id{match.group(1)}"
 
 
 def _clean_partner(value: str) -> str | None:

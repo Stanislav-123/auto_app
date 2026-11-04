@@ -75,6 +75,9 @@ def login_blocked_reason(text: str) -> str | None:
 
 def run_share(task: ShareTask, session: Any) -> list[ShareResult]:
     """По приложениям по очереди. Ошибка одного не останавливает остальные, 2FA останавливает."""
+    prepare = getattr(session, "ensure_session", None)
+    if prepare is not None:
+        prepare()
     results: list[ShareResult] = []
     items = list(task.pairs) if task.kind == "unity" else [(app, None) for app in task.apps]
     for app, extra in items:
