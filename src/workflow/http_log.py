@@ -14,6 +14,8 @@ _SENSITIVE_KEYS = {
     "token",
     "authorization",
     "key_p8",
+    "private_key",
+    "fcm_key",
     "fb_access_token",
     "fb_decryption_key",
     "settings_appsflyer_key_api_v2",

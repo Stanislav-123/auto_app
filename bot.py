@@ -73,6 +73,8 @@ from src.domains.setup import (
     search_specific,
     select_for_purchase,
 )
+from src.firebase.console import fetch_fcm_key
+from src.firebase.key import FcmKeyError, describe_key, parse_service_account
 from src.workflow.intake import extract_app_command_payload, workflow_reply_kind
 from src.workflow.locks import user_lock
 from src.workflow.logging_setup import setup_logging
@@ -1196,6 +1198,9 @@ async def _handle_crm_file_message(
         if stage == "apns":
             await _process_crm_apns(message, context, wf, files, temp_dir)
             return
+        if stage == "fcm":
+            await _process_crm_fcm(message, context, wf, temp_dir)
+            return
     except ValueError as exc:
         _log_user_action(update, "crm_file_error", error=str(exc))
         await _notify_error(message, str(exc))
@@ -1234,6 +1239,11 @@ async def _process_crm_zip(
         archive=filename,
     )
 
+    parsed_now = _parsed_from_dict(wf["parsed"])
+    if parsed_now.platform != Platform.IOS:
+        await _collect_fcm(message, context, wf)
+        return
+
     if wf.get("crm_needs_apns"):
         wf["crm_stage"] = "apns"
         await message.reply_text(
@@ -1268,6 +1278,66 @@ async def _process_crm_apns(
     files["apns"] = parse_apns_key_file(content, filename)
 
     _log_user_action(message, "crm_apns_received", filename=filename)
+    await _ask_crm_theme(message, wf)
+
+
+async def _collect_fcm(message, context: ContextTypes.DEFAULT_TYPE, wf: dict[str, Any]) -> None:
+    """Android: ключ FCM из Firebase console. Уже полученный ключ второй раз не генерим."""
+    if wf.get("fcm_key"):
+        await message.reply_text(f"FCM ключ уже есть: {describe_key(wf['fcm_key'])}")
+        await _ask_crm_theme(message, wf)
+        return
+    parsed = _parsed_from_dict(wf["parsed"])
+    await message.reply_text("✅ Архив получен. Получаю FCM ключ в Firebase…")
+    try:
+        data = await asyncio.to_thread(fetch_fcm_key, parsed.firebase_name)
+    except Exception as exc:
+        reason = str(exc) or exc.__class__.__name__
+        shot = getattr(exc, "screenshot", None)
+        logger.warning("fcm_auto_failed reason=%s", reason)
+        await _ask_fcm_file(message, context, wf, reason, shot)
+        return
+    wf["fcm_key"] = data
+    _persist_wf_message(message, context)
+    _log_user_action(message, "crm_fcm_generated", account=data.get("client_email"))
+    await message.reply_text(f"✅ FCM ключ получен: {describe_key(data)}")
+    await _ask_crm_theme(message, wf)
+
+
+async def _ask_fcm_file(message, context, wf: dict[str, Any], reason: str, shot: str | None) -> None:
+    wf["crm_stage"] = "fcm"
+    _persist_wf_message(message, context)
+    if shot and Path(shot).exists():
+        try:
+            with open(shot, "rb") as handle:
+                await message.reply_photo(handle, caption="Firebase")
+        except Exception:
+            logger.warning("fcm_screenshot_send_failed")
+    await message.reply_text(
+        f"Не получилось взять FCM ключ автоматически: {escape(reason)}\n\n"
+        "Отправьте <b>JSON-файл сервисного аккаунта Firebase</b> "
+        "(Project settings → Service accounts → Generate new private key).",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _process_crm_fcm(message, context, wf: dict[str, Any], temp_dir: Path) -> None:
+    document = message.document
+    if not document:
+        await _notify_error(message, "Отправьте FCM JSON-файл как документ.")
+        return
+    filename = safe_upload_filename(document.file_name, "fcm.json")
+    target = temp_dir / filename
+    telegram_file = await context.bot.get_file(document.file_id)
+    await telegram_file.download_to_drive(custom_path=str(target))
+    try:
+        data = parse_service_account(target.read_bytes())
+    finally:
+        target.unlink(missing_ok=True)
+    wf["fcm_key"] = data
+    _persist_wf_message(message, context)
+    _log_user_action(message, "crm_fcm_received", account=data.get("client_email"))
+    await message.reply_text(f"✅ FCM ключ принят: {describe_key(data)}")
     await _ask_crm_theme(message, wf)
 
 
