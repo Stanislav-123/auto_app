@@ -15,6 +15,7 @@ from src.appsflyer.flow import (
 )
 from src.appsflyer.parse import ParseError, parse_share
 from src.appsflyer.agency import drive_agency, plan_event_picks
+from src.appsflyer.tags import TAG_COMMIT_KEYS, choose_app_id_index, tag_already_present
 from src.appsflyer.plan import (
     AgencyPage,
     EventRow,
@@ -716,6 +717,29 @@ class TestLoginRedirect(unittest.TestCase):
             session._open_partner("coc.carwer.towrush", "vozartltd")
         self.assertIn("капча", str(caught.exception))
         self.assertIsNone(page.password_filled)
+
+
+class TestAppIdField(unittest.TestCase):
+    def test_snap_and_tiktok_labels(self):
+        self.assertEqual(choose_app_id_index(["Snap App ID"]), 0)
+        self.assertEqual(choose_app_id_index(["TikTok App ID"]), 0)
+        self.assertEqual(choose_app_id_index(["Notes", "Snap App ID"]), 1)
+
+    def test_platform_specific_when_present(self):
+        labels = ["Android App ID", "iOS App ID"]
+        self.assertEqual(choose_app_id_index(labels, platform="android"), 0)
+        self.assertEqual(choose_app_id_index(labels, platform="ios"), 1)
+        self.assertEqual(choose_app_id_index(["Snap App ID"], platform="android"), 0)
+
+    def test_class_hint_and_single_fallback(self):
+        self.assertEqual(choose_app_id_index(["Field"], ["snap_app_id-test"]), 0)
+        self.assertEqual(choose_app_id_index(["General settings"]), 0)
+        self.assertIsNone(choose_app_id_index(["Notes", "Cost"]))
+
+    def test_skip_existing_and_commit_order(self):
+        self.assertTrue(tag_already_present(["6a8d1073-f9b5-43ad-b185-232e0c52da57"], "6A8D1073-F9B5-43AD-B185-232E0C52DA57"))
+        self.assertFalse(tag_already_present(["existing"], "new-id"))
+        self.assertEqual(TAG_COMMIT_KEYS, ("Enter", ",", "Tab"))
 
 
 if __name__ == "__main__":
