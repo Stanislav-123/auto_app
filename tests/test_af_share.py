@@ -54,8 +54,9 @@ class FakeAf:
     def configure_tiktok(self, app, ids):
         return self._call(("tiktok", app, tuple(ids)), app)
 
-    def configure_unity(self, app, game_id):
-        return self._call(("unity", app, game_id), app)
+    def configure_unity(self, app, game_id, replace=False):
+        mark = ("unity", app, game_id, "replace") if replace else ("unity", app, game_id)
+        return self._call(mark, app)
 
     def configure_snapchat(self, app, ids):
         return self._call(("snapchat", app, tuple(ids)), app)
@@ -819,3 +820,33 @@ class ValuesRevenueLabelTest(unittest.TestCase):
         self.assertFalse(values_and_revenue("Values & no revenue"))
         self.assertTrue(values_and_revenue("Values & revenue"))
         self.assertTrue(values_and_revenue("all"))
+
+
+class UnityReplaceTest(unittest.TestCase):
+    def _page(self, gid, inapp=None):
+        from src.appsflyer.plan import IntegrationPage
+
+        return IntegrationPage(integrated=True, active=True, tags=[], rows=[], game_id=gid,
+                               inapp_game_id=gid if inapp is None else inapp, mapping_enabled=True)
+
+    def test_conflict_only_for_other_id(self):
+        from src.appsflyer.plan import unity_conflict
+
+        self.assertEqual(unity_conflict(self._page("1"), "2"), "1")
+        self.assertIsNone(unity_conflict(self._page("2"), "2"))
+        self.assertIsNone(unity_conflict(self._page(""), "2"))
+        self.assertEqual(unity_conflict(self._page("2", "1"), "2"), "1")
+
+    def test_replace_pairs_and_message(self):
+        from src.appsflyer.flow import unity_replace_pairs
+
+        task = ShareTask("unity", pairs=[("a.one", "2"), ("a.two", "3")])
+        results = [ShareResult("a.one", "conflict", "1"), ShareResult("a.two", "done")]
+        self.assertEqual(unity_replace_pairs(task, results), [("a.one", "2")])
+        self.assertIn("уже есть интеграция с Юнити", format_result(results[0]))
+        self.assertEqual(unity_replace_pairs(ShareTask("tiktok", apps=["a.one"]), results), [])
+
+    def test_replace_flag_reaches_session(self):
+        session = FakeAf({"a.one": ShareOutcome("done", "ok", ("c", "i"))})
+        run_share(ShareTask("unity", pairs=[("a.one", "2")], replace_game_id=True), session)
+        self.assertIn(("unity", "a.one", "2", "replace"), session.calls)

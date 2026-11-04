@@ -58,8 +58,10 @@ from src.appsflyer.flow import (
     menu_route,
     share_expects_text,
     share_menu_buttons,
+    unity_replace_pairs,
+    UNITY_REPLACE_QUESTION,
 )
-from src.appsflyer.session import AfBlocked, AfError, execute_share
+from src.appsflyer.session import AfBlocked, AfError, ShareTask, execute_share
 from src.domains.dynadot import DynadotClient
 from src.domains.portal import PortalDomainClient
 from src.domains.pricing import DomainQuote, is_ipv4, parse_domain_list
@@ -2121,8 +2123,37 @@ async def _run_share_task(message, task) -> None:
         return
     for item in results:
         await message.reply_text(format_result(item))
+    pairs = unity_replace_pairs(task, results)
+    if pairs:
+        _UNITY_PENDING[message.chat_id] = pairs
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Да", callback_data="unity:yes"), InlineKeyboardButton("Нет", callback_data="unity:no")]]
+        )
+        await message.reply_text(UNITY_REPLACE_QUESTION, reply_markup=markup)
+        return
     if results and all(item.status != "failed" for item in results):
         await message.reply_text("Расшарка закончена.")
+
+
+_UNITY_PENDING: dict[int, list[tuple[str, str]]] = {}
+
+
+async def handle_unity_replace_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    message = query.message
+    pairs = _UNITY_PENDING.pop(message.chat_id, None)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if not pairs:
+        await message.reply_text("Запрос устарел, запустите /share_unity заново.")
+        return
+    if query.data != "unity:yes":
+        await message.reply_text("Ок, Game ID не меняю.")
+        return
+    await _run_share_task(message, ShareTask("unity", pairs=pairs, replace_game_id=True))
 
 
 async def _start_share(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str) -> None:
@@ -2284,6 +2315,7 @@ def main() -> None:
     app.add_handler(CommandHandler("back_android", back_android_dev, filters=user_filter))
     app.add_handler(AllowedCallbackQueryHandler(handle_step_callback, user_filter, pattern=r"^wf:"))
     app.add_handler(AllowedCallbackQueryHandler(handle_domain_callback, user_filter, pattern=r"^dom:"))
+    app.add_handler(AllowedCallbackQueryHandler(handle_unity_replace_callback, user_filter, pattern=r"^unity:"))
     app.add_handler(AllowedCallbackQueryHandler(handle_menu_callback, user_filter, pattern=r"^(menu:|share:)"))
     app.add_handler(
         MessageHandler(

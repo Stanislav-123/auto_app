@@ -45,6 +45,7 @@ class ShareTask:
     ids: list[str] = field(default_factory=list)
     apps: list[str] = field(default_factory=list)
     pairs: list[tuple[str, str]] = field(default_factory=list)
+    replace_game_id: bool = False
 
 
 def partner_config_url(app: str, partner_id: str) -> str:
@@ -139,7 +140,7 @@ def _configure(session: Any, task: ShareTask, app: str, extra: str | None) -> Sh
     if task.kind == "tiktok":
         return session.configure_tiktok(app, list(task.ids))
     if task.kind == "unity":
-        return session.configure_unity(app, extra or "")
+        return session.configure_unity(app, extra or "", replace=task.replace_game_id)
     if task.kind == "snapchat":
         return session.configure_snapchat(app, list(task.ids))
     raise AfError(f"Неизвестный тип расшарки: {task.kind}")

@@ -9,6 +9,7 @@ from pathlib import Path
 from src.appsflyer.agency import drive_agency
 from src.appsflyer.tags import TAG_COMMIT_KEYS, choose_app_id_index, tag_already_present
 from src.appsflyer.plan import (
+    unity_conflict,
     PARTNER_IDS,
     AgencyPage,
     AgencyPlan,
@@ -225,7 +226,12 @@ class PlaywrightAppsFlyer:
     def configure_snapchat(self, app: str, snap_ids: list[str]) -> ShareOutcome:
         return self._configure_network(app, "snapchat", tags=snap_ids)
 
-    def configure_unity(self, app: str, game_id: str) -> ShareOutcome:
+    def configure_unity(self, app: str, game_id: str, *, replace: bool = False) -> ShareOutcome:
+        if not replace:
+            self._open_partner(app, PARTNER_IDS["unity"])
+            current = unity_conflict(self._read_integration(), game_id)
+            if current:
+                return ShareOutcome("conflict", current)
         outcome = self._configure_network(app, "unity", game_id=game_id)
         links = self._read_unity_links()
         detail = "интеграция уже стоит" if outcome.status == "already" else outcome.detail

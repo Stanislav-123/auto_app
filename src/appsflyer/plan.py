@@ -189,6 +189,18 @@ def plan_integration(
     )
 
 
+def unity_conflict(page: IntegrationPage, game_id: str) -> str | None:
+    """Старый Game ID, если Unity уже настроена с другим id."""
+    if not page.integrated:
+        return None
+    target = (game_id or "").strip()
+    for current in (page.game_id, page.inapp_game_id):
+        current = (current or "").strip()
+        if current and current != target:
+            return current
+    return None
+
+
 def _same(left: str, right: str) -> bool:
     return (left or "").strip().lower() == (right or "").strip().lower()
 
