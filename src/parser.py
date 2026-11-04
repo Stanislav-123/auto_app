@@ -56,6 +56,13 @@ FIELD_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             re.IGNORECASE | re.MULTILINE,
         ),
     ),
+    (
+        "firebase_keys",
+        re.compile(
+            r"^\s*Ключи\s+(?:в\s+)?firebase\s*[:：\-–—]\s*(.+)$",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
 ]
 
 LOOSE_DOMAIN_RE = re.compile(
@@ -232,6 +239,8 @@ def _is_label_line(line: str) -> bool:
         "Пуши",
         "Сайт разработчика",
         "Название в Firebase",
+        "Ключи firebase",
+        "Ключи Firebase",
         "Комментарий",
         "После ",
     )
@@ -331,6 +340,7 @@ def merge_missing_reply(app: ParsedApp, reply_text: str) -> ParsedApp:
         developer_site=app.developer_site,
         backend=app.backend,
         firebase_name=app.firebase_name,
+        firebase_keys=app.firebase_keys,
         raw_text=app.raw_text,
         missing_fields=list(app.missing_fields),
     )

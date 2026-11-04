@@ -67,6 +67,39 @@ def project_ref(firebase_name: str | None) -> tuple[str | None, str | None]:
     return None, raw
 
 
+def split_firebase_keys(raw: str | None) -> list[str]:
+    """«combo, reflex» -> ["combo", "reflex"]. Порядок как в сообщении."""
+    parts = [item.strip().strip("\"'`«»") for item in re.split(r"[,;\s]+", raw or "")]
+    return [item for item in parts if item]
+
+
+def split_domain(domain: str) -> tuple[str, str]:
+    """Две непустые части около середины, склейка даёт домен."""
+    value = (domain or "").strip()
+    if len(value) < 2:
+        raise ValueError("Домен слишком короткий, чтобы разбить на две части")
+    middle = len(value) // 2
+    return value[:middle], value[middle:]
+
+
+def rtdb_values(keys: list[str], domain: str) -> dict[str, str]:
+    if len(keys) != 2:
+        raise ValueError(f"Нужно ровно два ключа firebase, а пришло: {', '.join(keys) or 'ничего'}")
+    first, second = split_domain(domain)
+    return {keys[0]: first, keys[1]: second}
+
+
+def rtdb_changes(current: dict[str, str | None], wanted: dict[str, str]) -> dict[str, str]:
+    """Что поменять в базе. Пусто — всё уже стоит."""
+    return {key: value for key, value in wanted.items() if _rtdb_text(current.get(key)) != value}
+
+
+def _rtdb_text(value) -> str | None:
+    if value is None:
+        return None
+    return str(value).strip().strip('"')
+
+
 def extract_invite_links(text: str) -> list[str]:
     seen: list[str] = []
     for link in _INVITE_RE.findall(text or ""):

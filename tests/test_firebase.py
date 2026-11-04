@@ -74,3 +74,38 @@ class PersistTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RtdbTest(unittest.TestCase):
+    def test_parse_keys_line(self):
+        app = parse_app_message(ANDROID_MESSAGE + "\nКлючи firebase - combo, reflex\n")
+        from src.firebase.key import split_firebase_keys
+
+        self.assertEqual(split_firebase_keys(app.firebase_keys), ["combo", "reflex"])
+        self.assertEqual(split_firebase_keys("Reflex,combo"), ["Reflex", "combo"])
+        self.assertEqual(split_firebase_keys(None), [])
+
+    def test_split_domain(self):
+        from src.firebase.key import rtdb_values, split_domain
+
+        for domain in ("example.com", "ab", "a.io", "backend42.top"):
+            first, second = split_domain(domain)
+            self.assertTrue(first and second)
+            self.assertEqual(first + second, domain)
+        self.assertEqual(list(rtdb_values(["reflex", "combo"], "example.com")), ["reflex", "combo"])
+        with self.assertRaises(ValueError):
+            rtdb_values(["combo"], "example.com")
+        with self.assertRaises(ValueError):
+            split_domain("a")
+
+    def test_changes_only_what_differs(self):
+        from src.firebase.key import rtdb_changes
+
+        wanted = {"combo": "examp", "reflex": "le.com"}
+        self.assertEqual(rtdb_changes({"combo": '"examp"', "reflex": "le.com"}, wanted), {})
+        self.assertEqual(rtdb_changes({"combo": "old", "reflex": None}, wanted), wanted)
+
+    def test_rtdb_done_is_persisted(self):
+        from src.workflow import persist
+
+        self.assertIn("rtdb_done", persist._PERSIST_KEYS)

@@ -33,6 +33,7 @@ class ParsedApp:
     developer_site: Optional[str] = None
     backend: Optional[str] = None
     firebase_name: Optional[str] = None
+    firebase_keys: Optional[str] = None
     raw_text: str = ""
     missing_fields: list[str] = field(default_factory=list)
 
@@ -65,6 +66,7 @@ class ParsedApp:
             "backend": self.backend,
             "backend_url": self.backend_url,
             "firebase_name": self.firebase_name,
+            "firebase_keys": self.firebase_keys,
             "missing_fields": self.missing_fields,
             "raw_text": self.raw_text,
         }
@@ -89,6 +91,7 @@ def parsed_from_dict(data: dict) -> ParsedApp:
         developer_site=data.get("developer_site"),
         backend=data.get("backend"),
         firebase_name=data.get("firebase_name"),
+        firebase_keys=data.get("firebase_keys"),
         raw_text=data.get("raw_text", ""),
         missing_fields=list(data.get("missing_fields") or []),
     )

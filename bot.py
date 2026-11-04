@@ -73,8 +73,8 @@ from src.domains.setup import (
     search_specific,
     select_for_purchase,
 )
-from src.firebase.console import fetch_fcm_key
-from src.firebase.key import FcmKeyError, describe_key, parse_service_account
+from src.firebase.console import setup_firebase
+from src.firebase.key import describe_key, parse_service_account, rtdb_values, split_firebase_keys
 from src.workflow.intake import extract_app_command_payload, workflow_reply_kind
 from src.workflow.locks import user_lock
 from src.workflow.logging_setup import setup_logging
@@ -192,6 +192,7 @@ def _parsed_from_dict(data: dict) -> ParsedApp:
         developer_site=data.get("developer_site"),
         backend=data.get("backend"),
         firebase_name=data.get("firebase_name"),
+        firebase_keys=data.get("firebase_keys"),
         raw_text=data.get("raw_text", ""),
         missing_fields=data.get("missing_fields", []),
     )
@@ -1282,26 +1283,70 @@ async def _process_crm_apns(
 
 
 async def _collect_fcm(message, context: ContextTypes.DEFAULT_TYPE, wf: dict[str, Any]) -> None:
-    """Android: ключ FCM из Firebase console. Уже полученный ключ второй раз не генерим."""
+    """Android: ключ FCM и значения в Realtime Database через Firebase console.
+    Уже сделанное второй раз не делаем: ключ лежит в workflow, база помечена rtdb_done."""
+    parsed = _parsed_from_dict(wf["parsed"])
+    need_key = not wf.get("fcm_key")
+    rtdb = None
+    rtdb_note = ""
+    keys = split_firebase_keys(parsed.firebase_keys)
+    if keys and not wf.get("rtdb_done"):
+        domain = resolve_domain(wf)
+        try:
+            if not domain:
+                raise ValueError("домена ещё нет")
+            rtdb = rtdb_values(keys, domain)
+        except ValueError as exc:
+            rtdb_note = f"Ключи firebase не заполнены: {exc}."
     if wf.get("fcm_key"):
         await message.reply_text(f"FCM ключ уже есть: {describe_key(wf['fcm_key'])}")
+    if rtdb_note:
+        await message.reply_text(rtdb_note)
+    if not need_key and not rtdb:
         await _ask_crm_theme(message, wf)
         return
-    parsed = _parsed_from_dict(wf["parsed"])
-    await message.reply_text("✅ Архив получен. Получаю FCM ключ в Firebase…")
+    await message.reply_text("Захожу в Firebase…")
     try:
-        data = await asyncio.to_thread(fetch_fcm_key, parsed.firebase_name)
+        result = await asyncio.to_thread(setup_firebase, parsed.firebase_name, need_key=need_key, rtdb=rtdb)
     except Exception as exc:
         reason = str(exc) or exc.__class__.__name__
         shot = getattr(exc, "screenshot", None)
-        logger.warning("fcm_auto_failed reason=%s", reason)
-        await _ask_fcm_file(message, context, wf, reason, shot)
+        logger.warning("firebase_auto_failed reason=%s", reason)
+        if rtdb:
+            await _report_rtdb_manual(message, rtdb, reason, None if need_key else shot)
+        if need_key:
+            await _ask_fcm_file(message, context, wf, reason, shot)
+        else:
+            await _ask_crm_theme(message, wf)
         return
-    wf["fcm_key"] = data
+    if result.key:
+        wf["fcm_key"] = result.key
+        _log_user_action(message, "crm_fcm_generated", account=result.key.get("client_email"))
+        await message.reply_text(f"✅ FCM ключ получен: {describe_key(result.key)}")
+    if rtdb:
+        if result.rtdb in {"done", "already"}:
+            wf["rtdb_done"] = True
+            pairs = ", ".join(f"{k} = {v}" for k, v in rtdb.items())
+            word = "уже стояли" if result.rtdb == "already" else "записаны"
+            await message.reply_text(f"✅ Realtime Database: {pairs} ({word})")
+        else:
+            await _report_rtdb_manual(message, rtdb, result.rtdb_error, result.rtdb_screenshot)
     _persist_wf_message(message, context)
-    _log_user_action(message, "crm_fcm_generated", account=data.get("client_email"))
-    await message.reply_text(f"✅ FCM ключ получен: {describe_key(data)}")
     await _ask_crm_theme(message, wf)
+
+
+async def _report_rtdb_manual(message, rtdb: dict[str, str], reason: str, shot: str | None) -> None:
+    if shot and Path(shot).exists():
+        try:
+            with open(shot, "rb") as handle:
+                await message.reply_photo(handle, caption="Realtime Database")
+        except Exception:
+            logger.warning("rtdb_screenshot_send_failed")
+    pairs = "\n".join(f"<code>{escape(k)}</code> = <code>{escape(v)}</code>" for k, v in rtdb.items())
+    await message.reply_text(
+        f"Не получилось заполнить Realtime Database: {escape(reason)}\n\nПоставьте вручную:\n{pairs}",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def _ask_fcm_file(message, context, wf: dict[str, Any], reason: str, shot: str | None) -> None:

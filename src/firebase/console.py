@@ -9,7 +9,9 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
-from .key import FcmKeyError, extract_invite_links, parse_service_account, project_ref
+from dataclasses import dataclass
+
+from .key import FcmKeyError, extract_invite_links, parse_service_account, project_ref, rtdb_changes
 
 logger = logging.getLogger(__name__)
 
@@ -52,12 +54,31 @@ def open_context(pw, *, visible: bool | None = None):
         return pw.chromium.launch_persistent_context(str(path), **args)
 
 
+_ADD_CHILD_RE = re.compile(r"add child|добавить дочерн", re.I)
+_ADD_RE = re.compile(r"^\s*(add|добавить)\s*$", re.I)
+
+
+@dataclass
+class FirebaseResult:
+    key: dict | None = None
+    project_id: str | None = None
+    rtdb: str = "skipped"  # skipped / already / done / failed
+    rtdb_error: str = ""
+    rtdb_screenshot: str | None = None
+
+
 class FirebaseConsole:
     def __init__(self, log_dir: str | Path = "logs") -> None:
         self.log_dir = Path(log_dir)
         self.page = None
 
     def fetch_key(self, firebase_name: str | None) -> dict:
+        result = self.setup(firebase_name, need_key=True)
+        return result.key or {}
+
+    def setup(self, firebase_name: str | None, *, need_key: bool, rtdb: dict[str, str] | None = None) -> FirebaseResult:
+        """Ключ (если нужен) и значения в Realtime Database за один заход в браузер.
+        Ошибка ключа — FcmKeyError. Ошибка базы не роняет ключ, она в результате."""
         project_id, name = project_ref(firebase_name)
         if not project_id and not name:
             raise FcmKeyError("В сообщении нет «Название в Firebase».")
@@ -69,7 +90,18 @@ class FirebaseConsole:
                 context.set_default_timeout(timeout_ms())
                 self.page = context.pages[0] if context.pages else context.new_page()
                 try:
-                    return self._fetch(project_id, name)
+                    found = self._open_project(project_id, name)
+                    result = FirebaseResult(project_id=found)
+                    if need_key:
+                        result.key = self._generate(found)
+                    if rtdb:
+                        try:
+                            result.rtdb = self._set_rtdb(found, rtdb)
+                        except Exception as exc:
+                            result.rtdb = "failed"
+                            result.rtdb_error = str(exc) or exc.__class__.__name__
+                            result.rtdb_screenshot = self._shot("rtdb")
+                    return result
                 except FcmKeyError as exc:
                     if not exc.screenshot:
                         exc.screenshot = self._shot("fcm")
@@ -79,7 +111,7 @@ class FirebaseConsole:
             finally:
                 context.close()
 
-    def _fetch(self, project_id: str | None, name: str | None) -> dict:
+    def _open_project(self, project_id: str | None, name: str | None) -> str:
         self._goto(CONSOLE)
         self._require_login()
         found = self._find_project(project_id, name)
@@ -90,7 +122,67 @@ class FirebaseConsole:
             found = self._find_project(project_id, name)
         if not found:
             raise FcmKeyError(f"Проект «{name or project_id}» не виден в Firebase и приглашение не нашлось.")
-        return self._generate(found)
+        return found
+
+    def _set_rtdb(self, project_id: str, wanted: dict[str, str]) -> str:
+        self._goto(f"{CONSOLE}/project/{project_id}/database")
+        self._require_login()
+        try:
+            self.page.wait_for_url(re.compile(r"/database/.+/data"), timeout=timeout_ms())
+        except Exception as exc:
+            raise FcmKeyError("Не открылась Realtime Database (возможно, база не создана).") from exc
+        self.page.wait_for_timeout(2000)
+        changes = rtdb_changes(self._read_rtdb(list(wanted)), wanted)
+        if not changes:
+            return "already"
+        for key, value in changes.items():
+            if self._rtdb_key(key) is not None:
+                self._edit_rtdb_value(key, value)
+            else:
+                self._add_rtdb_child(key, value)
+            self.page.wait_for_timeout(1000)
+        left = rtdb_changes(self._read_rtdb(list(wanted)), wanted)
+        if left:
+            raise FcmKeyError("После записи в базе не те значения: " + ", ".join(left))
+        logger.info("fb_rtdb_set project=%s keys=%s", project_id, ",".join(changes))
+        return "done"
+
+    def _rtdb_key(self, key: str):
+        node = self.page.get_by_text(re.compile(rf"^\s*{re.escape(key)}\s*:?\s*$"))
+        return node.first if node.count() else None
+
+    def _read_rtdb(self, keys: list[str]) -> dict[str, str | None]:
+        values: dict[str, str | None] = {}
+        for key in keys:
+            node = self._rtdb_key(key)
+            if node is None:
+                values[key] = None
+                continue
+            row = node.locator("xpath=ancestor::*[contains(@class,'node') or contains(@class,'row') or self::li][1]")
+            text = (row.first.inner_text() if row.count() else node.locator("xpath=..").inner_text()).strip()
+            match = re.match(rf"^\s*{re.escape(key)}\s*:\s*(.*?)\s*$", text.splitlines()[0] if text else "")
+            values[key] = match.group(1).strip().strip('"') if match else None
+        return values
+
+    def _edit_rtdb_value(self, key: str, value: str) -> None:
+        node = self._rtdb_key(key)
+        target = node.locator("xpath=following-sibling::*[1]")
+        (target if target.count() else node).first.click()
+        field = self.page.locator("input:focus, textarea:focus")
+        field.first.wait_for(timeout=timeout_ms())
+        field.first.fill(value)
+        field.first.press("Enter")
+
+    def _add_rtdb_child(self, key: str, value: str) -> None:
+        button = self.page.get_by_role("button", name=_ADD_CHILD_RE)
+        if not button.count():
+            button = self.page.locator("[aria-label*='add' i], [title*='add child' i]")
+        button.first.click()
+        key_field = self.page.get_by_placeholder(re.compile(r"^(key|ключ)$", re.I))
+        value_field = self.page.get_by_placeholder(re.compile(r"^(value|значение)$", re.I))
+        key_field.first.fill(key)
+        value_field.first.fill(value)
+        self.page.get_by_role("button", name=_ADD_RE).first.click()
 
     def _goto(self, url: str) -> None:
         self.page.goto(url, wait_until="domcontentloaded")
@@ -196,6 +288,13 @@ class FirebaseConsole:
             return str(path)
         except Exception:
             return None
+
+
+def setup_firebase(firebase_name: str | None, *, need_key: bool, rtdb: dict[str, str] | None = None) -> FirebaseResult:
+    try:
+        return FirebaseConsole().setup(firebase_name, need_key=need_key, rtdb=rtdb)
+    except ImportError as exc:
+        raise FcmKeyError("Не установлен playwright.") from exc
 
 
 def fetch_fcm_key(firebase_name: str | None) -> dict:
