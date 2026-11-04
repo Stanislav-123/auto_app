@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from src.appsflyer.agency import drive_agency
+from src.appsflyer.tags import TAG_COMMIT_KEYS, choose_app_id_index, tag_already_present
 from src.appsflyer.plan import (
     PARTNER_IDS,
     AgencyPage,
@@ -658,10 +659,8 @@ class PlaywrightAppsFlyer:
     def _read_integration(self) -> IntegrationPage:
         assert self.page is not None
         self._click_tab("msc-tab-integration")
-        active = True
-        toggle = self.page.locator("input[data-qa-id=switch-input]").first
-        if toggle.count():
-            active = toggle.is_checked()
+        self._ensure_partner_active()
+        active = self._partner_active()
         mapping_root = self.page.locator("[data-qa-id=in-app-mapping]")
         mapping_enabled = True
         if mapping_root.count():
@@ -680,8 +679,8 @@ class PlaywrightAppsFlyer:
 
     def _apply_integration(self, plan: IntegrationPlan, *, game_id: str) -> None:
         assert self.page is not None
-        if plan.activate:
-            self._click_switch(self.page.locator("input[data-qa-id=switch-input]").first)
+        if plan.activate or not self._partner_active():
+            self._ensure_partner_active()
         for tag in plan.add_tags:
             self._add_tag(tag)
         if plan.set_game_id:
@@ -746,30 +745,141 @@ class PlaywrightAppsFlyer:
             return field.last
         return None
 
+    def _partner_active(self) -> bool:
+        assert self.page is not None
+        toggle = self.page.locator("[data-qa-id=enable-integration-toggle]")
+        if toggle.count():
+            return self._control_on(toggle.first)
+        legacy = self.page.locator("input[data-qa-id=switch-input]")
+        if legacy.count():
+            return legacy.first.is_checked()
+        return self.page.locator("[data-qa-id=extra-params]").count() > 0
+
+    def _control_on(self, node) -> bool:
+        aria = (node.get_attribute("aria-checked") or "").lower()
+        if aria in {"true", "false"}:
+            return aria == "true"
+        inner = node.locator("[role=checkbox], input[type=checkbox]")
+        if inner.count():
+            checked = (inner.first.get_attribute("aria-checked") or "").lower()
+            if checked in {"true", "false"}:
+                return checked == "true"
+            try:
+                return inner.first.is_checked()
+            except Exception:
+                return False
+        return False
+
+    def _ensure_partner_active(self) -> None:
+        assert self.page is not None
+        extra = self.page.locator("[data-qa-id=extra-params]")
+        if self._partner_active() and extra.count():
+            return
+        toggle = self.page.locator("[data-qa-id=enable-integration-toggle]")
+        legacy = self.page.locator("input[data-qa-id=switch-input]")
+        if not toggle.count() and not legacy.count():
+            return
+        self._focus("[data-qa-id=enable-integration-toggle]")
+        if toggle.count() and not self._control_on(toggle.first):
+            toggle.first.click()
+            if not self._control_on(toggle.first):
+                inner = toggle.locator("[role=checkbox], input[type=checkbox]")
+                if inner.count():
+                    inner.first.click()
+        elif legacy.count() and not legacy.first.is_checked():
+            self._click_switch(legacy.first)
+        try:
+            extra.first.wait_for(state="visible", timeout=self.timeout)
+        except Exception as exc:
+            raise AfError("После Activate partner блок настроек не появился") from exc
+
+    def _app_id_wrapper(self):
+        assert self.page is not None
+        root = self.page.locator("[data-qa-id=extra-params]")
+        if not root.count():
+            raise AfError("Не нашёл поле App ID")
+        wrappers = root.locator(".af-tag-input-wrapper")
+        labels: list[str] = []
+        classes: list[str] = []
+        for index in range(wrappers.count()):
+            wrapper = wrappers.nth(index)
+            label = wrapper.locator(".form-control-label")
+            labels.append(label.first.inner_text().strip() if label.count() else "")
+            kind = wrapper.get_attribute("class") or ""
+            parent = wrapper.locator("xpath=ancestor::*[contains(@class,'app_id')][1]")
+            if parent.count():
+                kind = f"{kind} {parent.first.get_attribute('class') or ''}"
+            classes.append(kind)
+        chosen = choose_app_id_index(labels, classes)
+        if chosen is None:
+            raise AfError("Не нашёл поле App ID")
+        return wrappers.nth(chosen)
+
     def _read_tags(self, root_qa: str) -> list[str]:
         assert self.page is not None
-        root = self._section(root_qa)
+        root = self.page.locator(f'[data-qa-id="{root_qa}"]')
         if not root.count():
             return []
+        if root_qa == "extra-params":
+            try:
+                scope = self._app_id_wrapper()
+            except AfError:
+                scope = root
+        else:
+            scope = root
         found: list[str] = []
-        chips = root.locator('[data-qa-id^="selected-option-"]')
+        chips = scope.locator(".af-tag-value")
         for index in range(chips.count()):
-            chip = chips.nth(index)
-            suffix = (chip.get_attribute("data-qa-id") or "").removeprefix("selected-option-").strip()
-            text = chip.inner_text().replace("×", "").replace("\u00d7", "").strip()
-            value = text or suffix
-            if value and value not in found:
-                found.append(value)
+            text = chips.nth(index).inner_text().strip()
+            if text and text not in found:
+                found.append(text)
         return found
 
     def _add_tag(self, value: str) -> None:
         assert self.page is not None
-        field = self._text_field(self._section("extra-params"))
-        if field is None:
-            raise AfError("Не нашёл поле App ID (ни Android, ни iOS).")
-        field.click()
-        field.fill(value)
-        field.press("Enter")
+        self._ensure_partner_active()
+        wrapper = self._app_id_wrapper()
+        self._focus("[data-qa-id=extra-params]")
+        if tag_already_present(self._tag_texts(wrapper), value):
+            return
+        opener = wrapper.locator(".af-tag-input-inner")
+        if not opener.count():
+            opener = wrapper.locator(".af-tag-input-tags-container")
+        if not opener.count():
+            raise AfError("Не нашёл поле App ID")
+        opener.first.click()
+        field = wrapper.locator("input.af-tag-input-input")
+        try:
+            field.first.wait_for(state="visible", timeout=self.timeout)
+        except Exception as exc:
+            raise AfError("Поле App ID не открылось") from exc
+        field.first.fill("")
+        field.first.press_sequentially(value, delay=15)
+        for key in TAG_COMMIT_KEYS:
+            field.first.press(key)
+            if self._wait_tag(wrapper, value, timeout=4000):
+                return
+        raise AfError(f"App ID {value} не добавился")
+
+    def _tag_texts(self, wrapper) -> list[str]:
+        found: list[str] = []
+        chips = wrapper.locator(".af-tag-value")
+        for index in range(chips.count()):
+            text = chips.nth(index).inner_text().strip()
+            if text:
+                found.append(text)
+        return found
+
+    def _wait_tag(self, wrapper, value: str, *, timeout: int) -> bool:
+        assert self.page is not None
+        wanted = value.strip()
+        try:
+            wrapper.locator(".af-tag-value").filter(
+                has_text=re.compile(rf"^\s*{re.escape(wanted)}\s*$", re.IGNORECASE)
+            ).first.wait_for(state="visible", timeout=timeout)
+            return True
+        except Exception:
+            return tag_already_present(self._tag_texts(wrapper), value)
 
     def _read_input(self, root_qa: str) -> str:
         assert self.page is not None
@@ -918,7 +1028,18 @@ class PlaywrightAppsFlyer:
         if button.first.is_disabled():
             raise AfError("Кнопка сохранения неактивна, страница не увидела изменений.")
         button.first.click()
-        self.page.get_by_text("All changes saved", exact=False).wait_for()
+        try:
+            self.page.wait_for_function(
+                """() => {
+                    const save = document.querySelector('[data-qa-id="save-tab-changes-btn"]');
+                    const saved = /all changes saved/i.test(document.body.innerText || '');
+                    const disabled = save && (save.disabled || save.getAttribute('aria-disabled') === 'true');
+                    return saved || disabled;
+                }""",
+                timeout=self.timeout,
+            )
+        except Exception as exc:
+            raise AfError("Сохранение не подтвердилось") from exc
         self._save_state()
 
     def _save_state(self) -> None:
