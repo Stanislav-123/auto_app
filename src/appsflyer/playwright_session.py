@@ -229,13 +229,24 @@ class PlaywrightAppsFlyer:
     def configure_unity(self, app: str, game_id: str, *, replace: bool = False) -> ShareOutcome:
         if not replace:
             self._open_partner(app, PARTNER_IDS["unity"])
-            current = unity_conflict(self._read_integration(), game_id)
+            current = unity_conflict(self._read_unity_settled(), game_id)
             if current:
                 return ShareOutcome("conflict", current)
         outcome = self._configure_network(app, "unity", game_id=game_id)
         links = self._read_unity_links()
         detail = "интеграция уже стоит" if outcome.status == "already" else outcome.detail
         return ShareOutcome(outcome.status, detail, links)
+
+    def _read_unity_settled(self, tries: int = 10) -> IntegrationPage:
+        """Game ID в форме появляется не сразу после загрузки: ждём, пока поле заполнится."""
+        assert self.page is not None
+        page = self._read_integration()
+        for _ in range(tries):
+            if not page.integrated or page.game_id.strip() or page.inapp_game_id.strip():
+                return page
+            self.page.wait_for_timeout(500)
+            page = self._read_integration()
+        return page
 
     def capture_failure(self, app: str, kind: str) -> str | None:
         if self.page is None:

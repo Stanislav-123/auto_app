@@ -850,3 +850,19 @@ class UnityReplaceTest(unittest.TestCase):
         session = FakeAf({"a.one": ShareOutcome("done", "ok", ("c", "i"))})
         run_share(ShareTask("unity", pairs=[("a.one", "2")], replace_game_id=True), session)
         self.assertIn(("unity", "a.one", "2", "replace"), session.calls)
+
+
+class UnitySettledReadTest(unittest.TestCase):
+    def test_waits_for_game_id_to_load(self):
+        from src.appsflyer.plan import IntegrationPage
+
+        session = PlaywrightAppsFlyer("user@example.com", "secret-pass")
+        pages = [IntegrationPage(True, True, [], [], "", "", True), IntegrationPage(True, True, [], [], "1", "1", True)]
+        session._read_integration = lambda: pages.pop(0) if len(pages) > 1 else pages[0]
+
+        class _P:
+            def wait_for_timeout(self, _):
+                pass
+
+        session.page = _P()
+        self.assertEqual(session._read_unity_settled().game_id, "1")
