@@ -182,6 +182,8 @@ def continue_share(job: dict, text: str) -> FlowStep:
 def format_result(result: ShareResult) -> str:
     if result.status == "done":
         line = f"{result.app} — готово"
+        if result.reason and result.reason != "права сохранены":
+            line = f"{line}\n{result.reason}"
     elif result.status == "already":
         line = f"{result.app} — уже настроено"
     else:

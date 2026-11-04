@@ -14,7 +14,7 @@ from src.appsflyer.flow import (
     share_menu_buttons,
 )
 from src.appsflyer.parse import ParseError, parse_share
-from src.appsflyer.agency import drive_agency
+from src.appsflyer.agency import drive_agency, plan_event_picks
 from src.appsflyer.plan import (
     AgencyPage,
     EventRow,
@@ -221,7 +221,11 @@ class _AgencyUi:
         return list(self.events)
 
     def add_event(self, name):
+        available = getattr(self, "available", None)
+        if available is not None and name not in available:
+            return "missing"
         self.events.append(name)
+        return "added"
 
     def sending(self):
         return self.sending_value
@@ -261,6 +265,38 @@ class TestAgencyOrder(unittest.TestCase):
         self.assertEqual(steps[-1], "sending")
         self.assertTrue(all(ui.on[item] for item in clicks))
         self.assertEqual(ui.sending_value, "send-all")
+
+    def test_missing_app_event_is_skipped(self):
+        picks = plan_event_picks(
+            ("af_app_opened", "af_complete_registration", "af_purchase"),
+            [],
+            {"af_complete_registration", "af_purchase"},
+            1,
+        )
+        self.assertEqual(
+            picks,
+            [
+                ("missing", "af_app_opened"),
+                ("use_empty", "af_complete_registration"),
+                ("add_row", "af_purchase"),
+            ],
+        )
+        ui = _AgencyUi()
+        ui.available = {"af_complete_registration", "af_purchase"}
+        steps = drive_agency(ui)
+        self.assertIn("missing:af_app_opened", steps)
+        self.assertIn("event:af_complete_registration", steps)
+        self.assertIn("event:af_purchase", steps)
+        self.assertNotIn("event:af_app_opened", steps)
+
+    def test_already_selected_event_does_not_take_a_row(self):
+        picks = plan_event_picks(
+            ("af_purchase", "af_complete_registration"),
+            ["af_purchase"],
+            {"af_purchase", "af_complete_registration"},
+            1,
+        )
+        self.assertEqual(picks, [("skip", "af_purchase"), ("use_empty", "af_complete_registration")])
 
 
 class TestPlan(unittest.TestCase):
@@ -472,6 +508,11 @@ class TestMenu(unittest.TestCase):
         self.assertIn("готово", format_result(ShareResult("io.example.demo", "done")))
         self.assertIn("уже настроено", format_result(ShareResult("io.example.demo", "already")))
         self.assertIn("ошибка: нет страницы", format_result(ShareResult("io.example.demo", "failed", "нет страницы")))
+        note = format_result(
+            ShareResult("coc.carwer.towrush", "done", "af_app_opened нет в списке событий приложения — пропущено")
+        )
+        self.assertIn("готово", note)
+        self.assertIn("af_app_opened нет в списке событий приложения — пропущено", note)
 
 
 class _State:

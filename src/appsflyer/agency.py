@@ -31,11 +31,37 @@ class AgencyUi(Protocol):
 
     def known_events(self) -> list[str]: ...
 
-    def add_event(self, name: str) -> None: ...
+    def add_event(self, name: str) -> str | None: ...
 
     def sending(self) -> str: ...
 
     def set_sending(self) -> None: ...
+
+
+def plan_event_picks(
+    wanted: tuple[str, ...] | list[str],
+    selected: list[str] | set[str],
+    available: list[str] | set[str],
+    empty_rows: int,
+) -> list[tuple[str, str]]:
+    """skip / missing / use_empty / add_row. Пропуск не занимает пустую строку."""
+    empty = empty_rows
+    chosen = set(selected)
+    catalog = set(available)
+    picks: list[tuple[str, str]] = []
+    for event in wanted:
+        if event in chosen:
+            picks.append(("skip", event))
+            continue
+        if event not in catalog:
+            picks.append(("missing", event))
+            continue
+        if empty > 0:
+            picks.append(("use_empty", event))
+            empty -= 1
+        else:
+            picks.append(("add_row", event))
+    return picks
 
 
 def drive_agency(ui: AgencyUi) -> list[str]:
@@ -53,10 +79,21 @@ def drive_agency(ui: AgencyUi) -> list[str]:
     present = set(ui.known_events())
     for event in AGENCY_EVENTS:
         if event in present:
+            done.append(f"skip:{event}")
             continue
-        ui.add_event(event)
+        status = ui.add_event(event) or "added"
+        if status == "missing":
+            done.append(f"missing:{event}")
+            continue
+        if status == "skipped":
+            done.append(f"skip:{event}")
+            present.add(event)
+            continue
         done.append(f"event:{event}")
         present.add(event)
+    discard = getattr(ui, "discard_empty_rows", None)
+    if callable(discard):
+        discard()
     revenue = "allow_send_events_revenue_toggled"
     if not ui.has(revenue):
         ui.wait_has(revenue)
