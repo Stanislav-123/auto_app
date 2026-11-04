@@ -103,14 +103,38 @@ def values_and_revenue(value: str | None) -> bool:
     return text == "all" or ("value" in text and "revenue" in text)
 
 
+# Мастер, затем подтумблеры. Add validation rules только после View.
+# Send events revenue — после Configure in-app event postbacks и списка событий.
+AGENCY_BEFORE_EVENTS = (
+    "AgencyPermissions",
+    "access_retention_report",
+    "access_aggregate_organic_data",
+    "agency_validation_rules_viewable",
+    "agency_validation_rules_add",
+    "raw_data",
+    "p360",
+    "creative",
+    "allowInappEventsConfiguration",
+)
+AGENCY_AFTER_EVENTS = ("allow_send_events_revenue_toggled",)
+
+
+def order_agency_toggles(ids: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    """Порядок включения. Неизвестные тумблеры — до блока событий, revenue — после."""
+    present = set(ids)
+    ordered = [item for item in AGENCY_BEFORE_EVENTS if item in present]
+    known = set(AGENCY_BEFORE_EVENTS + AGENCY_AFTER_EVENTS)
+    ordered.extend(item for item in ids if item not in known)
+    ordered.extend(item for item in AGENCY_AFTER_EVENTS if item in present)
+    return tuple(ordered)
+
+
 def plan_agency(page: AgencyPage) -> AgencyPlan:
     if not page.integrated:
         return AgencyPlan(need_integrate=True)
     if not page.toggles:
         return AgencyPlan(problem="Не вижу переключатели прав агентства")
-    turn_on = tuple(key for key, enabled in page.toggles.items() if not enabled)
-    if "AgencyPermissions" in turn_on:
-        turn_on = ("AgencyPermissions",) + tuple(item for item in turn_on if item != "AgencyPermissions")
+    turn_on = tuple(item for item in order_agency_toggles(tuple(page.toggles)) if not page.toggles[item])
     present = {item.strip() for item in page.events}
     add_events = tuple(event for event in AGENCY_EVENTS if event not in present)
     set_sending = not sending_is_all(page.sending)

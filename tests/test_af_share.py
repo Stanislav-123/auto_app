@@ -14,16 +14,19 @@ from src.appsflyer.flow import (
     share_menu_buttons,
 )
 from src.appsflyer.parse import ParseError, parse_share
+from src.appsflyer.agency import drive_agency
 from src.appsflyer.plan import (
     AgencyPage,
     EventRow,
     IntegrationPage,
+    order_agency_toggles,
     plan_agency,
     plan_integration,
 )
 from src.appsflyer.playwright_session import PlaywrightAppsFlyer
 from src.appsflyer.session import (
     AfBlocked,
+    AfError,
     ShareOutcome,
     ShareResult,
     ShareTask,
@@ -144,6 +147,120 @@ class TestParse(unittest.TestCase):
         parsed = parse_share("agency", f"{link} io.example.demo")
         self.assertEqual(parsed.partner_id, "agencytest1")
         self.assertEqual(parsed.apps, ["io.example.demo"])
+
+
+class _AgencyUi:
+    SUBS = (
+        "access_retention_report",
+        "access_aggregate_organic_data",
+        "agency_validation_rules_viewable",
+        "agency_validation_rules_add",
+        "raw_data",
+        "p360",
+        "creative",
+        "allowInappEventsConfiguration",
+    )
+
+    def __init__(self, *, flaky: bool = False, have_events: list[str] | None = None):
+        self.on = {"AgencyPermissions": False}
+        self.enabled = {"AgencyPermissions": True}
+        self.clicks: list[str] = []
+        self.tries: dict[str, int] = {}
+        self.events = list(have_events or [])
+        self.sending_value = ""
+        self.focused = None
+        self.flaky = flaky
+        self.add_ready = False
+
+    def ids(self):
+        return list(self.on)
+
+    def has(self, qa_id):
+        return qa_id in self.on
+
+    def checked(self, qa_id):
+        return bool(self.on.get(qa_id))
+
+    def wait_subs(self):
+        if not self.on.get("AgencyPermissions"):
+            raise AfError("подтумблеры ещё не показаны")
+
+    def wait_enabled(self, qa_id):
+        if not self.enabled.get(qa_id):
+            raise AfError(f"{qa_id} ещё выключен по зависимости")
+
+    def wait_has(self, qa_id):
+        if qa_id not in self.on:
+            raise AfError(f"нет тумблера {qa_id}")
+
+    def click(self, qa_id):
+        self.clicks.append(qa_id)
+        self.tries[qa_id] = self.tries.get(qa_id, 0) + 1
+        if self.flaky and self.tries[qa_id] == 1:
+            return
+        self.on[qa_id] = True
+        if qa_id == "AgencyPermissions":
+            for sub in self.SUBS:
+                self.on.setdefault(sub, False)
+                self.enabled[sub] = sub != "agency_validation_rules_add"
+        if qa_id == "agency_validation_rules_viewable":
+            self.enabled["agency_validation_rules_add"] = True
+        if qa_id == "allowInappEventsConfiguration":
+            self.add_ready = True
+            self.on.setdefault("allow_send_events_revenue_toggled", False)
+            self.enabled["allow_send_events_revenue_toggled"] = True
+
+    def focus(self, qa_id):
+        self.focused = qa_id
+
+    def wait_add_event(self):
+        if not self.add_ready:
+            raise AfError("кнопки Add event ещё нет")
+
+    def known_events(self):
+        return list(self.events)
+
+    def add_event(self, name):
+        self.events.append(name)
+
+    def sending(self):
+        return self.sending_value
+
+    def set_sending(self):
+        self.sending_value = "send-all"
+
+
+class TestAgencyOrder(unittest.TestCase):
+    def test_dependency_order(self):
+        ordered = order_agency_toggles(
+            [
+                "allow_send_events_revenue_toggled",
+                "agency_validation_rules_add",
+                "AgencyPermissions",
+                "allowInappEventsConfiguration",
+                "agency_validation_rules_viewable",
+                "raw_data",
+                "custom_extra",
+            ]
+        )
+        self.assertLess(ordered.index("AgencyPermissions"), ordered.index("agency_validation_rules_viewable"))
+        self.assertLess(ordered.index("agency_validation_rules_viewable"), ordered.index("agency_validation_rules_add"))
+        self.assertLess(ordered.index("allowInappEventsConfiguration"), ordered.index("custom_extra"))
+        self.assertLess(ordered.index("custom_extra"), ordered.index("allow_send_events_revenue_toggled"))
+
+    def test_drive_waits_for_dependencies_and_retries(self):
+        ui = _AgencyUi(flaky=True, have_events=["af_app_opened"])
+        steps = drive_agency(ui)
+        clicks = [item.split(":", 1)[1] for item in steps if item.startswith("click:")]
+        self.assertEqual(clicks[0], "AgencyPermissions")
+        self.assertEqual(ui.tries["AgencyPermissions"], 2)
+        self.assertLess(clicks.index("agency_validation_rules_viewable"), clicks.index("agency_validation_rules_add"))
+        self.assertLess(steps.index("click:allowInappEventsConfiguration"), steps.index("event:af_complete_registration"))
+        self.assertNotIn("event:af_app_opened", steps)
+        self.assertLess(steps.index("event:af_purchase"), steps.index("click:allow_send_events_revenue_toggled"))
+        self.assertEqual(steps[-1], "sending")
+        self.assertTrue(all(ui.on[item] for item in clicks))
+        self.assertEqual(ui.sending_value, "send-all")
 
 
 class TestPlan(unittest.TestCase):
