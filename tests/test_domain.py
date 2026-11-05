@@ -130,5 +130,38 @@ class TestDomainPayload(unittest.TestCase):
         self.assertTrue(any(path.startswith("/app/update") for path in calls))
 
 
+    def test_rules_view_soft_domain_error_still_updates(self):
+        client = CrmClient("https://crm.test/api", access_token="t")
+        calls = []
+
+        def fake(method, path, payload=None, auth=True):
+            calls.append((method, path, payload))
+            if path.startswith("/domain/index"):
+                return {"models": [{"domain": "example.sbs"}]}
+            if path.startswith("/app/view"):
+                return {"apps_name": "Searock", "app_domain": ""}
+            if path.startswith("/app/update"):
+                return {"app_domain": payload["app_domain"]}
+            if path.startswith("/app/rules-view"):
+                return {
+                    "model": {"id": 1, "apps_id": 15, "domain": None, "not_domain": True},
+                    "error": True,
+                    "msg_error": (
+                        "Не указан домен. Укажите домен, сохраните настройки "
+                        "и заново войдите в режи редактирования!"
+                    ),
+                }
+            if path.startswith("/app/rules-update"):
+                return {"model": {"domain": payload["domain"]}}
+            raise AssertionError(path)
+
+        with patch.object(client, "_request", side_effect=fake):
+            result = client.set_app_domain(15, "example.sbs")
+
+        rules = next(payload for method, path, payload in calls if path.startswith("/app/rules-update"))
+        self.assertEqual(rules["domain"], "example.sbs")
+        self.assertEqual(result["domain"], "example.sbs")
+
+
 if __name__ == "__main__":
     unittest.main()

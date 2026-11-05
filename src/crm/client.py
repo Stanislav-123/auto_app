@@ -12,6 +12,7 @@ from src.crm.domain import (
     build_rules_domain_payload,
     crm_result_error,
     is_domain_not_found,
+    is_rules_domain_missing_soft_error,
     normalize_backend_domain,
 )
 from src.http_errors import transport_failure
@@ -199,7 +200,7 @@ class CrmClient:
 
         rules_view = self._request("GET", f"/app/rules-view?id={app_id}")
         rules_view_error = crm_result_error(rules_view)
-        if rules_view_error:
+        if rules_view_error and not is_rules_domain_missing_soft_error(rules_view):
             raise CrmError(f"CRM rules-view: {rules_view_error}")
 
         rules_payload = build_rules_domain_payload(rules_view, app_id, saved_name)

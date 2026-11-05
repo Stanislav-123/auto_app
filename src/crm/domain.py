@@ -82,6 +82,24 @@ def build_rules_domain_payload(view: Any, app_id: int, domain: str) -> dict[str,
     return model
 
 
+
+def is_rules_domain_missing_soft_error(result: Any) -> bool:
+    """CRM rules-view часто отвечает error+msg про пустой domain, но model уже есть.
+
+    Это не отказ: портал просит сохранить домен в правилах. Бот как раз и шлёт
+    rules-update следом, поэтому soft-error нельзя рвать цепочку.
+    """
+    if not isinstance(result, dict):
+        return False
+    model = result.get("model")
+    if not isinstance(model, dict):
+        return False
+    if not (result.get("error") or result.get("success") is False):
+        return False
+    text = str(result.get("msg_error") or result.get("message") or "").lower()
+    return "не указан домен" in text or "укажите домен" in text
+
+
 def crm_result_error(result: Any) -> str | None:
     """Текст ошибки из JSON-тела, если CRM отказала без HTTP-ошибки."""
     if not isinstance(result, dict):
