@@ -80,7 +80,7 @@ python scripts/google_login.py
 
 ## Расшарка AppsFlyer
 
-У AppsFlyer нет API на выдачу прав партнёру, бот открывает кабинет через Playwright. По умолчанию берёт **системный Chrome** (`AF_BROWSER_CHANNEL=chrome`), иначе Edge/`AF_BROWSER_PATH`, и только потом bundled Chromium — AF часто рвёт TLS к Chromium (`ERR_CONNECTION_CLOSED`). Логин только почта и пароль: `AF_EMAIL`, `AF_PASSWORD`. Кнопку Google не нажимает. Сессия пишется в `data/af_state.json` (файл в `.gitignore`) и подхватывается, пока её не разлогинит. `AF_HEADLESS=1` по умолчанию, `0` — окно браузера. Таймаут шага: `AF_TIMEOUT_MS` (45000). Goto на сетевые обрывы ретраит до 3 раз.
+У AppsFlyer нет API на выдачу прав партнёру, бот открывает кабинет через Playwright. По умолчанию берёт **системный Chrome** (`AF_BROWSER_CHANNEL=chrome`), иначе Edge/`AF_BROWSER_PATH`, и только потом bundled Chromium — AF часто рвёт TLS к Chromium (`ERR_CONNECTION_CLOSED`). Логин только почта и пароль: `AF_EMAIL`, `AF_PASSWORD`. Кнопку Google не нажимает. Если AF отвечает Invalid username or password — бот пишет про неверные креды в `.env`. Сессия пишется в `data/af_state.json` (файл в `.gitignore`) и подхватывается, пока её не разлогинит. `AF_HEADLESS=1` по умолчанию, `0` — окно браузера. Таймаут шага: `AF_TIMEOUT_MS` (45000). Goto на сетевые обрывы ретраит до 3 раз.
 
 После `pip install -r requirements.txt`:
 

@@ -74,6 +74,41 @@ def login_blocked_reason(text: str) -> str | None:
     return None
 
 
+def login_auth_error_reason(text: str) -> str | None:
+    """Неверный логин/пароль или аккаунт заблокирован на форме входа."""
+    blob = (text or "").lower()
+    if any(
+        token in blob
+        for token in (
+            "invalid username or password",
+            "incorrect username or password",
+            "incorrect email or password",
+            "wrong email or password",
+            "wrong password",
+            "invalid credentials",
+            "authentication failed",
+            "неверн",
+            "неправильн",
+        )
+    ):
+        return (
+            "Неверный логин или пароль AppsFlyer. "
+            "Проверьте AF_EMAIL и AF_PASSWORD в .env и повторите."
+        )
+    if any(
+        token in blob
+        for token in (
+            "account locked",
+            "account is locked",
+            "too many attempts",
+            "temporarily locked",
+            "account disabled",
+        )
+    ):
+        return "Аккаунт AppsFlyer заблокирован или временно недоступен. Войдите вручную в браузере."
+    return None
+
+
 def run_share(task: ShareTask, session: Any) -> list[ShareResult]:
     """По приложениям по очереди. Ошибка одного не останавливает остальные, 2FA останавливает."""
     prepare = getattr(session, "ensure_session", None)
