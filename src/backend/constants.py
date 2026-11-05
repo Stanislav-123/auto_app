@@ -39,9 +39,20 @@ def _env(name: str) -> str:
     return os.getenv(name, "").strip()
 
 
-def binom_tracker_url() -> str:
-    """Click URL трекера (без key). Задаётся в BACKEND_BINOM_URL."""
-    return _env("BACKEND_BINOM_URL")
+def binom_tracker_url(campaign_url: str | None = None) -> str:
+    """Click URL трекера (без key).
+
+    Сначала BACKEND_BINOM_URL из .env. Если пусто — берём base URL кампании Binom
+    (всё до '?'), чтобы шаг бэкенда не падал на живом заводе, когда в .env
+    забыли прописать трекер, а ключ кампании уже есть.
+    """
+    configured = _env("BACKEND_BINOM_URL")
+    if configured:
+        return configured
+    raw = (campaign_url or "").strip()
+    if not raw:
+        return ""
+    return raw.split("?", 1)[0].strip()
 
 
 def appsflyer_dev_key() -> str:

@@ -138,7 +138,7 @@ class NewBackendClient:
             f"(name={name!r}, domain={domain!r}, store_id={store_id!r})"
         )
 
-    def configure_app(self, app_panel_id: int, binom_key: str) -> None:
+    def configure_app(self, app_panel_id: int, binom_key: str, *, campaign_url: str | None = None) -> None:
         """Update required fields on /apps/{id}/edit and submit Save."""
         self._ensure_login()
         if not binom_key:
@@ -148,11 +148,13 @@ class NewBackendClient:
         html = self._get(edit_url)
         form_data = _parse_form_fields(html)
 
-        tracker_url = binom_tracker_url()
+        tracker_url = binom_tracker_url(campaign_url)
         af_key = appsflyer_dev_key()
         af_v2 = appsflyer_api_v2_key()
         if not tracker_url:
-            raise NewBackendError("Не задан BACKEND_BINOM_URL")
+            raise NewBackendError(
+                "Не задан BACKEND_BINOM_URL и нет URL кампании Binom для fallback"
+            )
         if not af_key or not af_v2:
             raise NewBackendError("Не заданы APPSFLYER_DEV_KEY и APPSFLYER_API_V2_KEY")
 

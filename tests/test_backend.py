@@ -58,6 +58,26 @@ class TestNewBackendConstants(unittest.TestCase):
             self.assertEqual(appsflyer_dev_key(), "")
             self.assertEqual(appsflyer_api_v2_key(), "")
 
+    def test_falls_back_to_campaign_url(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                binom_tracker_url(
+                    "https://tracker.example/click.php?key=abc&t1={creo}"
+                ),
+                "https://tracker.example/click.php",
+            )
+
+    def test_env_wins_over_campaign_url(self):
+        with patch.dict(
+            os.environ,
+            {"BACKEND_BINOM_URL": "https://from-env.example/c.php"},
+            clear=False,
+        ):
+            self.assertEqual(
+                binom_tracker_url("https://campaign.example/c.php?key=x"),
+                "https://from-env.example/c.php",
+            )
+
 
 class TestBinomKeyExtract(unittest.TestCase):
     def test_prefers_explicit_key(self):
