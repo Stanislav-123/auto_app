@@ -29,6 +29,7 @@ from src.appsflyer.session import (
     headless_enabled,
     login_auth_error_reason,
     login_blocked_reason,
+    login_mode,
     partner_config_url,
     safe_filename,
     state_path,
@@ -191,7 +192,14 @@ class PlaywrightAppsFlyer:
         self.email = email
         self.password = password
         self.state_file = Path(state_file or state_path())
-        self.headless = headless_enabled() if headless is None else headless
+        self.login_mode = login_mode()
+        if headless is None:
+            self.headless = False if self.login_mode == "manual" else headless_enabled()
+        else:
+            self.headless = headless
+        if self.login_mode == "manual" and self.headless:
+            logger.warning("af_login_mode=manual forces headed browser")
+            self.headless = False
         self.timeout = timeout_ms() if timeout is None else timeout
         self.log_dir = Path(log_dir)
         self._pw = None
@@ -446,9 +454,46 @@ class PlaywrightAppsFlyer:
         return "content"
 
     def _login_and_store(self) -> None:
-        logger.info("af_login")
-        self._submit_login()
+        logger.info("af_login mode=%s", self.login_mode)
+        if self.login_mode == "manual":
+            self._wait_manual_login()
+        else:
+            self._submit_login()
         self._save_state()
+
+    def _wait_manual_login(self) -> None:
+        """Окно Chrome: пользователь жмёт Google/SSO/пароль сам. Ждём ухода с /auth/login."""
+        assert self.page is not None
+        logger.info("af_login_manual_wait email=%s", (self.email[:2] + "***") if self.email else "")
+        # Give the human enough time for Google picker / 2FA.
+        wait_ms = max(self.timeout, 300_000)
+        try:
+            self.page.wait_for_function(
+                """() => {
+                    const path = location.pathname.toLowerCase();
+                    const onLogin = path.includes('/auth/login') || path.endsWith('/login');
+                    const pwd = document.querySelector("input[type=password]");
+                    const visible = pwd && pwd.offsetParent !== null;
+                    return !onLogin && !visible;
+                }""",
+                timeout=wait_ms,
+            )
+        except Exception as exc:
+            auth_err = self._auth_error_reason()
+            if auth_err:
+                self._shot_login_failure()
+                raise AfError(auth_err) from exc
+            blocked = self._blocked_reason()
+            if blocked:
+                self._shot_login_failure()
+                raise AfBlocked(blocked) from exc
+            self._shot_login_failure()
+            raise AfError(
+                "Ручной вход в AppsFlyer не завершён. Войдите в открытом окне (Google/SSO/пароль) "
+                "и дождитесь кабинета — сессия сохранится сама."
+            ) from exc
+        if self._login_form_visible():
+            self._raise_if_still_login()
 
     def _submit_login(self) -> None:
         assert self.page is not None
@@ -456,14 +501,28 @@ class PlaywrightAppsFlyer:
         if blocked:
             raise AfBlocked(blocked)
         email = self.page.locator(
-            "input[type=email], input[name=username], input[name=email], "
+            "input#user-email, input[type=email], input[name=username], input[name=email], "
             "input[placeholder*='email' i], input[autocomplete=username]"
         )
-        password = self.page.locator("input[type=password], input[placeholder*='password' i]")
+        password = self.page.locator(
+            "input#password-field, input[type=password], input[placeholder*='password' i]"
+        )
         if not email.count() or not password.count():
             raise AfError("Форма входа AppsFlyer без полей email и password.")
+        email.first.fill("")
         email.first.fill(self.email)
+        password.first.fill("")
         password.first.fill(self.password)
+        filled = ""
+        try:
+            filled = (email.first.input_value() or "").strip()
+        except Exception:
+            filled = ""
+        if filled and filled.casefold() != self.email.casefold():
+            raise AfError(
+                f"Не смог подставить AF_EMAIL в форму (в поле оказалось не то значение). "
+                "Проверьте страницу входа или AF_LOGIN_MODE=manual."
+            )
         remember = self.page.get_by_role("checkbox", name=re.compile(r"Remember me", re.I))
         if remember.count():
             if not remember.first.is_checked():
@@ -555,7 +614,7 @@ class PlaywrightAppsFlyer:
             return ""
 
     def _auth_error_reason(self) -> str | None:
-        return login_auth_error_reason(self._page_body_text())
+        return login_auth_error_reason(self._page_body_text(), email=self.email)
 
     def _shot_login_failure(self) -> None:
         try:

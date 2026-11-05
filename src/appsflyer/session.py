@@ -74,7 +74,26 @@ def login_blocked_reason(text: str) -> str | None:
     return None
 
 
-def login_auth_error_reason(text: str) -> str | None:
+def mask_email(email: str | None) -> str | None:
+    """bd@example.com -> bd***@example.com. Без полного адреса в логах и ошибках."""
+    value = (email or "").strip()
+    if not value or "@" not in value:
+        return None
+    local, _, domain = value.partition("@")
+    if len(local) >= 2:
+        return f"{local[:2]}***@{domain}"
+    return f"***@{domain}"
+
+
+def login_mode() -> str:
+    """password (default) или manual — пользователь сам жмёт Google/SSO/пароль в окне."""
+    raw = (os.getenv("AF_LOGIN_MODE") or "password").strip().lower()
+    if raw in {"manual", "interactive", "browser", "sso", "google"}:
+        return "manual"
+    return "password"
+
+
+def login_auth_error_reason(text: str, email: str | None = None) -> str | None:
     """Неверный логин/пароль или аккаунт заблокирован на форме входа."""
     blob = (text or "").lower()
     if any(
@@ -91,9 +110,14 @@ def login_auth_error_reason(text: str) -> str | None:
             "неправильн",
         )
     ):
+        who = mask_email(email)
+        suffix = f" для {who}" if who else ""
         return (
-            "Неверный логин или пароль AppsFlyer. "
-            "Проверьте AF_EMAIL и AF_PASSWORD в .env и повторите."
+            f"Неверный логин или пароль AppsFlyer{suffix}. "
+            "Бот жмёт обычный Email/Password, не «Log in with Google» и не SSO. "
+            "Если в Chrome вы входите через Google — пароль в .env тут ни при чём: "
+            "либо задайте рабочий пароль именно для AF_EMAIL, либо AF_HEADLESS=0 и "
+            "AF_LOGIN_MODE=manual (войти вручную один раз, сессия уйдёт в data/af_state.json)."
         )
     if any(
         token in blob

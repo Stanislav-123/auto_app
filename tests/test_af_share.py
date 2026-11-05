@@ -26,6 +26,9 @@ from src.appsflyer.plan import (
 )
 from src.appsflyer.playwright_session import PlaywrightAppsFlyer
 from src.appsflyer.session import (
+    mask_email,
+    login_mode,
+
     AfBlocked,
     AfError,
     ShareOutcome,
@@ -442,10 +445,15 @@ class TestShareRun(unittest.TestCase):
         self.assertIn("2FA", login_blocked_reason("Enter the verification code"))
         self.assertIn("капча", login_blocked_reason("I'm not a robot"))
         self.assertIsNone(login_blocked_reason("Permissions"))
-        self.assertIn("AF_EMAIL", login_auth_error_reason("Invalid username or password"))
-        self.assertIn("AF_PASSWORD", login_auth_error_reason("Wrong email or password"))
+        msg = login_auth_error_reason("Invalid username or password", email="bd@millxgroup.com")
+        self.assertIn("bd***@millxgroup.com", msg)
+        self.assertIn("Google", msg)
+        self.assertIn("AF_LOGIN_MODE=manual", msg)
+        self.assertIn("AF_EMAIL", login_auth_error_reason("Wrong email or password") or "")
         self.assertIn("заблок", login_auth_error_reason("Account locked after too many attempts"))
         self.assertIsNone(login_auth_error_reason("Permissions"))
+        self.assertEqual(mask_email("bd@millxgroup.com"), "bd***@millxgroup.com")
+        self.assertEqual(login_mode(), "password")
         self.assertIn("agencytest1", partner_config_url("io.example.demo", "agencytest1"))
         self.assertEqual(
             partner_config_url("id1234567890", "tiktokglobal_int"),
@@ -912,3 +920,21 @@ class TestAfBrowserLaunch(unittest.TestCase):
         session._goto("https://hq1.appsflyer.com/auth/login")
         self.assertEqual(page.calls, 3)
         self.assertEqual(page.waited, [800, 1600])
+
+
+class TestLoginHelpers(unittest.TestCase):
+    def test_login_mode_manual(self):
+        import os
+        from src.appsflyer import session as af_session
+
+        old = os.environ.get("AF_LOGIN_MODE")
+        try:
+            os.environ["AF_LOGIN_MODE"] = "manual"
+            self.assertEqual(af_session.login_mode(), "manual")
+            os.environ["AF_LOGIN_MODE"] = "password"
+            self.assertEqual(af_session.login_mode(), "password")
+        finally:
+            if old is None:
+                os.environ.pop("AF_LOGIN_MODE", None)
+            else:
+                os.environ["AF_LOGIN_MODE"] = old
