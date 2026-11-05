@@ -47,6 +47,7 @@ _PERSIST_KEYS = {
     "failed_error",
     "domain_job",
     "share_job",
+    "app_queue",
 }
 
 
