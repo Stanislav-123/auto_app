@@ -297,7 +297,7 @@ def run_ios_backend(wf: dict[str, Any], client: Any) -> StepResult:
     domain = resolve_domain(wf)
     try:
         app = client.find_app(name=parsed.name, domain=domain, store_id=parsed.store_id)
-        client.configure_app(app.id, binom_key=binom_key)
+        client.configure_app(app.id, binom_key=binom_key, campaign_url=binom.get("url"))
     except Exception as exc:
         from src.backend.new_panel import NewBackendError
 
