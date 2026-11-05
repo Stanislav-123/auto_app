@@ -444,6 +444,22 @@ class TestBusyRollback(unittest.TestCase):
         )
         return messages, cfs, snapshots
 
+    def test_domain_created_while_account_still_free(self):
+        crm = FakeCRM([_account(1)])
+        seen = []
+
+        def wrap(payload):
+            seen.append(crm.accounts[0]["status"])
+            crm.created.append(payload)
+
+        crm.create_portal_domain = wrap
+        states = [{"name": "free.top", "done": []}]
+        messages, _cfs, _snapshots = self._run(states, crm.accounts, crm)
+        self.assertEqual(seen, [0])
+        self.assertEqual(crm.accounts[0]["status"], 1)
+        self.assertTrue(any("добавлен в CRM" in line for line in messages))
+        self.assertTrue(any("отмечен занятым" in line for line in messages))
+
     def test_status_only_then_fields_without_email(self):
         crm = _BusyCRM([_account(1)], missing_fields=True)
         states = [{"name": "keep.top", "done": []}]
@@ -466,7 +482,7 @@ class TestBusyRollback(unittest.TestCase):
         self.assertIsNone(states[0].get("failed_step"))
         self.assertTrue(any("занятым" in line for line in messages))
 
-    def test_conflict_deletes_created_zone_and_retries(self):
+    def test_email_taken_keeps_zone_and_finishes(self):
         crm = _BusyCRM([_account(1), _account(2, "cf-2")], fail_ids={1})
         excluded = []
         states = [
@@ -489,11 +505,6 @@ class TestBusyRollback(unittest.TestCase):
             cfs[account["id"]] = client
             return client
 
-        snapshots = []
-
-        def progress():
-            snapshots.append(copy.deepcopy(states[0]))
-
         messages = run_confirmed_batch(
             states,
             dynadot=dyn,
@@ -502,44 +513,36 @@ class TestBusyRollback(unittest.TestCase):
             confirmed=True,
             today=date(2026, 11, 3),
             cf_factory=factory,
-            on_progress=progress,
             excluded_ids=excluded,
         )
-        notice = (
-            "аккаунт u1@cf.test не удалось пометить занятым "
-            f"({BUSY_409}), зону удалил, беру следующий"
-        )
-        self.assertIn(notice, messages)
+        self.assertTrue(any("не пометился занятым" in line for line in messages))
         self.assertEqual(dyn.registered, [])
-        self.assertEqual(cfs[1].deleted, ["z-keep.top"])
-        self.assertEqual(cfs[1].calls, [])
-        self.assertEqual(cfs[2].deleted, [])
-        self.assertEqual([call[0] for call in cfs[2].calls], ["zone", "a", "ssl"])
-        self.assertEqual([payload for _, payload in crm.busy], [{"status": 1}, {"status": 1}])
+        self.assertEqual(cfs[1].deleted, [])
+        self.assertEqual([call[0] for call in cfs[1].calls], ["a", "ssl"])
+        self.assertNotIn(2, cfs)
+        self.assertEqual([payload for _, payload in crm.busy], [{"status": 1}])
         self.assertEqual(len(crm.created), 1)
-        self.assertEqual(states[0]["cf_account"]["id"], 2)
-        self.assertIn("zone", states[0]["done"])
+        self.assertEqual(crm.created[0]["cloudflare_accounts"][0]["cf_db_account_id"], "1")
+        self.assertEqual(states[0]["cf_account"]["id"], 1)
+        self.assertIn("cf_busy", states[0]["done"])
+        self.assertIn("crm_domain", states[0]["done"])
         self.assertIsNone(states[0].get("failed_step"))
-        rolled = next(item for item in snapshots if item.get("cf_attempts") == 1)
-        self.assertIsNone(rolled["zone_id"])
-        self.assertNotIn("cf_account", rolled)
-        self.assertNotIn("zone", rolled["done"])
-        self.assertIsNone(rolled["cf_crm_id"])
-        self.assertFalse(rolled["zone_created"])
-        self.assertEqual(excluded, ["1"])
+        self.assertEqual(excluded, [])
 
-    def test_existing_zone_is_not_deleted(self):
-        crm = _BusyCRM([_account(1), _account(2, "cf-2")], fail_ids={1})
+    def test_busy_error_after_domain_keeps_park(self):
+        crm = _BusyCRM([_account(1), _account(2, "cf-2")], fail_ids={1}, error="HTTP 500: boom")
         states = [{"name": "keep.top", "done": []}]
         messages, cfs, _snapshots = self._run(states, crm.accounts, crm, created=False)
         self.assertEqual(cfs[1].deleted, [])
-        self.assertEqual(cfs[2].deleted, [])
-        self.assertTrue(any("зону не трогаю" in line for line in messages))
+        self.assertNotIn(2, cfs)
         self.assertFalse(any("зону удалил" in line for line in messages))
-        self.assertEqual(states[0]["cf_account"]["id"], 2)
+        self.assertEqual(states[0]["cf_account"]["id"], 1)
         self.assertEqual(len(crm.created), 1)
+        self.assertIn("crm_domain", states[0]["done"])
+        self.assertTrue(states[0].get("cf_busy_error"))
+        self.assertTrue(any("не пометился занятым" in line for line in messages))
 
-    def test_fallback_reject_still_rolls_back(self):
+    def test_fallback_email_taken_continues(self):
         crm = _BusyCRM(
             [_account(1), _account(2, "cf-2")],
             fail_ids={1},
@@ -552,33 +555,31 @@ class TestBusyRollback(unittest.TestCase):
         self.assertNotIn("email", crm.busy[1][1])
         self.assertEqual(crm.busy[1][1]["status"], 1)
         self.assertIn("account_id", crm.busy[1][1])
-        self.assertEqual(crm.busy[2][1], {"status": 1})
-        self.assertEqual(cfs[1].deleted, ["z-keep.top"])
-        self.assertEqual(states[0]["cf_account"]["id"], 2)
-        self.assertTrue(any("зону удалил" in line for line in messages))
+        self.assertEqual(len(crm.busy), 2)
+        self.assertEqual(cfs[1].deleted, [])
+        self.assertEqual(states[0]["cf_account"]["id"], 1)
+        self.assertTrue(any("не пометился занятым" in line for line in messages))
         self.assertEqual(len(crm.created), 1)
 
-    def test_stops_after_five_bad_accounts(self):
-        accounts = [_account(i, f"cf-{i}") for i in range(1, 7)]
-        crm = _BusyCRM(accounts, fail_ids=set(range(1, 6)))
+    def test_two_domains_park_even_if_busy_fails(self):
+        accounts = [_account(i, f"cf-{i}") for i in range(1, 4)]
+        crm = _BusyCRM(accounts, fail_ids={1, 2}, error="HTTP 500: boom")
         excluded = []
         states = [
             {"name": "bad.top", "done": []},
             {"name": "next.sbs", "done": []},
         ]
         messages, cfs, _snapshots = self._run(states, accounts, crm, excluded=excluded)
-        self.assertEqual(states[0]["failed_step"], "cf_busy")
-        self.assertEqual(states[0]["cf_attempts"], 5)
-        self.assertIsNone(states[0]["zone_id"])
-        self.assertNotIn("cf_account", states[0])
-        self.assertNotIn("zone", states[0]["done"])
-        self.assertIn("buy", states[0]["done"])
-        self.assertEqual([item["batch"] for item in crm.created], ["next.sbs"])
-        self.assertEqual(states[1]["cf_account"]["id"], 6)
-        self.assertEqual(sum(len(client.deleted) for client in cfs.values()), 5)
-        self.assertEqual(excluded, ["1", "2", "3", "4", "5"])
-        self.assertEqual(sum(1 for line in messages if "зону удалил" in line), 5)
-        self.assertTrue(any("5 попыток" in line for line in messages))
+        self.assertIsNone(states[0].get("failed_step"))
+        self.assertIn("crm_domain", states[0]["done"])
+        self.assertIn("crm_domain", states[1]["done"])
+        self.assertEqual([item["batch"] for item in crm.created], ["bad.top", "next.sbs"])
+        self.assertEqual(states[0]["cf_account"]["id"], 1)
+        self.assertEqual(states[1]["cf_account"]["id"], 2)
+        self.assertEqual(sum(len(client.deleted) for client in cfs.values()), 0)
+        self.assertTrue(states[0].get("cf_busy_error"))
+        self.assertTrue(states[1].get("cf_busy_error"))
+        self.assertEqual(excluded, [])
 
 
 class TestMasking(unittest.TestCase):
