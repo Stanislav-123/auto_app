@@ -147,6 +147,33 @@ class _AgencyPage:
         self.session._discard_empty_event_rows()
 
 
+
+def _browser_executable() -> str | None:
+    """AF_BROWSER_PATH / BROWSER_PATH, else common Chrome/Edge/Yandex installs."""
+    for key in ("AF_BROWSER_PATH", "BROWSER_PATH"):
+        explicit = (os.getenv(key) or "").strip().strip('"')
+        if explicit and Path(explicit).is_file():
+            return explicit
+    home = Path.home()
+    candidates = [
+        Path(os.environ["LOCALAPPDATA"]) / "Google/Chrome/Application/chrome.exe" if os.getenv("LOCALAPPDATA") else None,
+        Path(os.environ["ProgramFiles"]) / "Google/Chrome/Application/chrome.exe" if os.getenv("ProgramFiles") else None,
+        Path(os.environ.get("ProgramFiles(x86)", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ["LOCALAPPDATA"]) / "Microsoft/Edge/Application/msedge.exe" if os.getenv("LOCALAPPDATA") else None,
+        Path(os.environ["ProgramFiles"]) / "Microsoft/Edge/Application/msedge.exe" if os.getenv("ProgramFiles") else None,
+        Path(os.environ["LOCALAPPDATA"]) / "Yandex/YandexBrowser/Application/browser.exe" if os.getenv("LOCALAPPDATA") else None,
+        Path("/usr/bin/google-chrome"),
+        Path("/usr/bin/google-chrome-stable"),
+        Path("/usr/bin/chromium"),
+        Path("/usr/bin/chromium-browser"),
+        home / "AppData/Local/Google/Chrome/Application/chrome.exe",
+    ]
+    for candidate in candidates:
+        if candidate and candidate.is_file():
+            return str(candidate)
+    return None
+
+
 class PlaywrightAppsFlyer:
     """Живой UI AppsFlyer. Состояние «ещё не интегрирован» на TikTok/Unity/Snap не снимали."""
 
@@ -171,6 +198,7 @@ class PlaywrightAppsFlyer:
         self._context = None
         self.page = None
         self._target_url = None
+        self._used_system_browser = False
 
     @classmethod
     def from_env(cls) -> PlaywrightAppsFlyer:
@@ -183,12 +211,14 @@ class PlaywrightAppsFlyer:
         from playwright.sync_api import sync_playwright
 
         self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(headless=self.headless)
+        self._browser = self._launch_browser()
         context_args = {
-            "user_agent": _USER_AGENT,
             "viewport": {"width": 1440, "height": 900},
             "locale": "en-US",
         }
+        # Bundled Chromium only: real Chrome/Edge already send a matching UA.
+        if not getattr(self, "_used_system_browser", False):
+            context_args["user_agent"] = _USER_AGENT
         if self.state_file.exists():
             context_args["storage_state"] = str(self.state_file)
         try:
@@ -200,6 +230,46 @@ class PlaywrightAppsFlyer:
         self._context.set_default_timeout(self.timeout)
         self.page = self._context.new_page()
         return self
+
+    def _launch_browser(self):
+        """Prefer system Chrome/Edge (AF often closes TLS to bundled Chromium)."""
+        assert self._pw is not None
+        launch_args = {
+            "headless": self.headless,
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+        # Optional explicit proxy only. Do NOT force proxy=direct:// — on Windows Playwright
+        # that yields ERR_PROXY_CONNECTION_FAILED. Clearing env proxies is enough.
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            os.environ.pop(key, None)
+        proxy_override = (os.getenv("AF_PROXY") or "").strip()
+        if proxy_override and proxy_override.lower() not in {"0", "off", "none", "false", "direct"}:
+            launch_args["proxy"] = {"server": proxy_override}
+            logger.info("af_browser_proxy=custom")
+
+        exe = _browser_executable()
+        if exe:
+            try:
+                browser = self._pw.chromium.launch(executable_path=exe, **launch_args)
+                self._used_system_browser = True
+                logger.info("af_browser executable=%s", exe)
+                return browser
+            except Exception as exc:
+                logger.warning("af_browser_failed path=%s error=%s", exe, str(exc)[:200])
+
+        channel = (os.getenv("AF_BROWSER_CHANNEL") or "chrome").strip().lower() or "chrome"
+        if channel not in {"0", "off", "none", "chromium"}:
+            try:
+                browser = self._pw.chromium.launch(channel=channel, **launch_args)
+                self._used_system_browser = True
+                logger.info("af_browser channel=%s", channel)
+                return browser
+            except Exception as exc:
+                logger.warning("af_browser_channel_failed channel=%s error=%s", channel, str(exc)[:200])
+
+        self._used_system_browser = False
+        logger.info("af_browser fallback=chromium")
+        return self._pw.chromium.launch(**launch_args)
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if exc_type is None:
@@ -305,7 +375,33 @@ class PlaywrightAppsFlyer:
 
     def _goto(self, url: str) -> None:
         assert self.page is not None
-        self.page.goto(url, wait_until="domcontentloaded")
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                self.page.goto(url, wait_until="domcontentloaded")
+                return
+            except Exception as exc:
+                last_exc = exc
+                msg = str(exc)
+                transient = any(
+                    token in msg
+                    for token in (
+                        "ERR_CONNECTION_CLOSED",
+                        "ERR_CONNECTION_RESET",
+                        "ERR_CONNECTION_REFUSED",
+                        "ERR_TIMED_OUT",
+                        "ERR_SSL",
+                        "ERR_TUNNEL",
+                        "net::ERR_",
+                        "Timeout",
+                    )
+                )
+                logger.warning("af_goto_failed attempt=%s url=%s error=%s", attempt, url, msg[:240])
+                if not transient or attempt == 3:
+                    raise
+                self.page.wait_for_timeout(800 * attempt)
+        if last_exc:
+            raise last_exc
 
     def _login_form_visible(self) -> bool:
         assert self.page is not None

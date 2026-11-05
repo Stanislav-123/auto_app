@@ -866,3 +866,44 @@ class UnitySettledReadTest(unittest.TestCase):
 
         session.page = _P()
         self.assertEqual(session._read_unity_settled().game_id, "1")
+
+
+class TestAfBrowserLaunch(unittest.TestCase):
+    def test_browser_executable_honors_af_path(self):
+        import os
+        from src.appsflyer import playwright_session as ps
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "chrome.exe"
+            fake.write_text("x")
+            old = os.environ.get("AF_BROWSER_PATH")
+            os.environ["AF_BROWSER_PATH"] = str(fake)
+            try:
+                self.assertEqual(ps._browser_executable(), str(fake))
+            finally:
+                if old is None:
+                    os.environ.pop("AF_BROWSER_PATH", None)
+                else:
+                    os.environ["AF_BROWSER_PATH"] = old
+
+    def test_goto_retries_connection_closed(self):
+        session = PlaywrightAppsFlyer(email="a", password="b")
+
+        class BoomPage:
+            def __init__(self):
+                self.calls = 0
+                self.waited = []
+
+            def goto(self, url, wait_until="domcontentloaded"):
+                self.calls += 1
+                if self.calls < 3:
+                    raise RuntimeError("Page.goto: net::ERR_CONNECTION_CLOSED at " + url)
+                return None
+
+            def wait_for_timeout(self, ms):
+                self.waited.append(ms)
+
+        page = BoomPage()
+        session.page = page
+        session._goto("https://hq1.appsflyer.com/auth/login")
+        self.assertEqual(page.calls, 3)
+        self.assertEqual(page.waited, [800, 1600])
