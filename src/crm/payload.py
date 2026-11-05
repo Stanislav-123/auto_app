@@ -47,7 +47,6 @@ def build_create_app_payload(
     *,
     logo: Optional[str] = None,
     banner: Optional[str] = None,
-    banner_appcraft: Optional[str] = None,
     slider: Optional[str] = None,
     apns_key: Optional[dict[str, str]] = None,
     fcm_key: Optional[dict[str, Any]] = None,
@@ -100,7 +99,6 @@ def build_create_app_payload(
         "tenjin_api_key": None,
         "logo": logo,
         "banner": banner,
-        "banner_appcraft": banner_appcraft,
         "slider": slider,
     }
 

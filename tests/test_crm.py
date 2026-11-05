@@ -37,7 +37,6 @@ class TestCrmPayload(unittest.TestCase):
             app,
             logo="data:image/png;base64,AAA",
             banner="data:image/png;base64,BBB",
-            banner_appcraft="data:image/png;base64,CCC",
             slider="data:image/png;base64,DDD",
             apns_key={"team_id": "TEAM", "key_id": "KEY", "key_p8": "BEGIN"},
             theme_id=1,
@@ -96,12 +95,12 @@ class TestZipAssets(unittest.TestCase):
     def test_classify_ios_names(self):
         self.assertEqual(classify_image_filename("logo.png"), "logo")
         self.assertEqual(classify_image_filename("ZM_iOS Banner.png"), "banner")
-        self.assertEqual(classify_image_filename("AC_iOS Banner.png"), "banner_appcraft")
+        self.assertEqual(classify_image_filename("AC_iOS Banner.png"), None)
         self.assertEqual(classify_image_filename("compressed_banner.png"), "slider")
 
     def test_classify_android_names(self):
         self.assertEqual(classify_image_filename("ZM_Android Banner.png"), "banner")
-        self.assertEqual(classify_image_filename("AC_Android Banner.png"), "banner_appcraft")
+        self.assertEqual(classify_image_filename("AC_Android Banner.png"), None)
 
     def test_extract_from_zip(self):
         with TemporaryDirectory() as tmp:
@@ -116,7 +115,7 @@ class TestZipAssets(unittest.TestCase):
                 archive.writestr("compressed_banner.png", b"slider")
 
             result = extract_crm_images_from_zip(zip_path, extract_dir)
-            self.assertEqual(set(result.keys()), {"logo", "banner", "banner_appcraft", "slider"})
+            self.assertEqual(set(result.keys()), {"logo", "banner", "slider"})
             for value in result.values():
                 self.assertTrue(value.startswith("data:image/"))
 

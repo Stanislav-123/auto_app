@@ -29,7 +29,6 @@ _SENSITIVE_KEYS = {
 _BINARYISH_KEYS = {
     "logo",
     "banner",
-    "banner_appcraft",
     "slider",
     "apns_key",
 }
