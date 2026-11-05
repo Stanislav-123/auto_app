@@ -78,6 +78,21 @@ from src.firebase.key import describe_key, parse_service_account, rtdb_values, s
 from src.workflow.intake import extract_app_command_payload, workflow_reply_kind
 from src.workflow.locks import user_lock
 from src.workflow.logging_setup import setup_logging
+from src.workflow.queue import (
+    QUEUE_STORE_KEY,
+    busy_factory_prompt,
+    clear_queue,
+    enqueue_workflow,
+    format_cancelled,
+    format_enqueue_result,
+    format_nothing_to_cancel,
+    format_queue_cleared,
+    format_start_next,
+    is_factory_active,
+    preview_label,
+    queue_size,
+    start_next,
+)
 from src.workflow.runner import (
     cleanup_crm_temp,
     execute_next,
@@ -130,6 +145,10 @@ START_TEXT = (
     "Дальше шаги идут сами. Архив, тематику, домен и ключи Facebook "
     "бот попросит отдельно, их можно присылать обычным сообщением.\n\n"
     "Просто пересланный текст без <code>/app</code> завод не запускает.\n\n"
+    "Если уже идёт завод, следующий <code>/app</code> с текстом встанет в очередь "
+    "и запустится сам, когда текущий закончится или его отменят.\n"
+    "<code>/cancel</code> — отменить текущее и взять следующее из очереди.\n"
+    "<code>/clear_queue</code> — очистить очередь, текущее не трогает.\n\n"
     "Покупка домена: <code>/domain</code> (Dynadot, Cloudflare, CRM).\n"
     "Расшарка AppsFlyer: <code>/share_partner</code>, <code>/share_tiktok</code>, "
     "<code>/share_unity</code>, <code>/share_snapchat</code>.\n"
@@ -244,6 +263,117 @@ def _delete_persisted_wf(update: Update, wf: dict[str, Any] | None = None) -> No
         _workflow_store.delete(_user_id(update), app_key)
     except OSError:
         logger.exception("Failed to delete persisted workflow")
+
+
+def _ensure_app_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if "app_queue" in context.user_data:
+        return
+    saved = _workflow_store.load(_user_id(update), QUEUE_STORE_KEY)
+    items = (saved or {}).get("app_queue") if isinstance(saved, dict) else None
+    context.user_data["app_queue"] = list(items) if isinstance(items, list) else []
+
+
+def _persist_app_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _ensure_app_queue(update, context)
+    items = list(context.user_data.get("app_queue") or [])
+    try:
+        if items:
+            _workflow_store.save(_user_id(update), {"app_key": QUEUE_STORE_KEY, "app_queue": items})
+        else:
+            _workflow_store.delete(_user_id(update), QUEUE_STORE_KEY)
+    except OSError:
+        logger.exception("Failed to persist app queue")
+
+
+def _snapshot_from_parsed(parsed) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "parsed": parsed.to_dict(),
+        "completed_steps": [WorkflowStep.PARSE.value],
+    }
+    app_key = app_key_from_parsed(parsed)
+    if app_key:
+        snapshot["app_key"] = app_key
+    if not is_parse_complete(parsed):
+        snapshot["awaiting_missing"] = True
+        snapshot["awaiting_after"] = "binom"
+    resolve_domain(snapshot)
+    return snapshot
+
+
+async def _enqueue_app_payload(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> None:
+    message = update.effective_message
+    _ensure_app_queue(update, context)
+    parsed = parse_app_message(text)
+    result = enqueue_workflow(
+        context.user_data,
+        _snapshot_from_parsed(parsed),
+        current_wf=_workflow(context),
+    )
+    if result.status == "queued":
+        _persist_app_queue(update, context)
+        _log_user_action(
+            update,
+            "app_queued",
+            position=result.position,
+            app_key=result.item.get("app_key"),
+            name=parsed.name,
+        )
+    if message:
+        await message.reply_text(format_enqueue_result(result), parse_mode=ParseMode.HTML)
+
+
+async def _start_next_from_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    message = update.effective_message
+    _ensure_app_queue(update, context)
+    next_wf = start_next(context.user_data)
+    _persist_app_queue(update, context)
+    if next_wf is None:
+        return False
+
+    wf = _workflow(context)
+    cleanup_crm_temp(wf)
+    wf.clear()
+    wf.update(next_wf)
+    remaining = queue_size(context.user_data)
+    label = preview_label(wf)
+    if message:
+        await message.reply_text(format_start_next(label, remaining), parse_mode=ParseMode.HTML)
+
+    parsed = _parsed_from_dict(wf["parsed"]) if wf.get("parsed") else None
+    if parsed is None:
+        return False
+
+    _log_user_action(
+        update,
+        "app_queue_started",
+        app_key=wf.get("app_key"),
+        name=parsed.name,
+        remaining=remaining,
+    )
+    reply = (
+        f"<b>Шаг 1 — {STEP_LABELS[WorkflowStep.PARSE]}</b>\n\n"
+        f"{format_parsed_app(parsed)}"
+    )
+    if not is_parse_complete(parsed):
+        wf["awaiting_missing"] = True
+        wf.setdefault("awaiting_after", "binom")
+        _persist_wf(update, context)
+        if message:
+            await message.reply_text(reply, parse_mode=ParseMode.HTML)
+            await message.reply_text(format_missing_prompt(parsed), parse_mode=ParseMode.HTML)
+        return True
+
+    resolve_domain(wf)
+    _persist_wf(update, context)
+    if message:
+        reply += "\n\n✅ <b>Шаг 1 выполнен.</b> Данные распознаны. Запускаю следующие шаги."
+        await message.reply_text(reply, parse_mode=ParseMode.HTML)
+    await _run_pipeline(update, context, wf)
+    return True
 
 
 def _resume_keyboard() -> InlineKeyboardMarkup:
@@ -523,12 +653,14 @@ async def _run_pipeline(update: Update, context: ContextTypes.DEFAULT_TYPE, wf: 
                 "Старый бэкенд пока не автоматизирован.",
                 parse_mode=ParseMode.HTML,
             )
+            await _start_next_from_queue(update, context)
             return
         if action in {"need_missing", "need_parse", "done"}:
             if action == "done":
                 cleanup_crm_temp(wf)
                 _delete_persisted_wf(update, wf)
                 await message.reply_text("✅ <b>Готово.</b> Все шаги выполнены.", parse_mode=ParseMode.HTML)
+                await _start_next_from_queue(update, context)
             return
 
         label = _action_label(action)
@@ -598,14 +730,33 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def app_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Старт завода: /app с текстом сразу или /app и данные следующим сообщением."""
+    message = update.message
+    if not message:
+        return
+
+    payload = extract_app_command_payload(message.text or message.caption or "")
+    _log_user_action(update, "app_command", has_payload=bool(payload))
+    _ensure_app_queue(update, context)
+    if is_factory_active(_workflow(context)):
+        if payload:
+            await _enqueue_app_payload(update, context, payload)
+            return
+        await message.reply_text(
+            busy_factory_prompt(preview_label(_workflow(context)), queue_size(context.user_data)),
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
     async def _body() -> None:
-        message = update.message
-        if not message:
+        if is_factory_active(_workflow(context)):
+            if payload:
+                await _enqueue_app_payload(update, context, payload)
+                return
+            await message.reply_text(
+                busy_factory_prompt(preview_label(_workflow(context)), queue_size(context.user_data)),
+                parse_mode=ParseMode.HTML,
+            )
             return
-
-        payload = extract_app_command_payload(message.text or message.caption or "")
-        _log_user_action(update, "app_command", has_payload=bool(payload))
         if not payload:
             wf = _workflow(context)
             wf.clear()
@@ -616,6 +767,49 @@ async def app_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _ingest_app_text(update, context, payload)
 
     await _run_locked(update, _body)
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отменить текущий завод и сразу взять следующее из очереди."""
+
+    async def _body() -> None:
+        message = update.message
+        if not message:
+            return
+        _ensure_app_queue(update, context)
+        wf = _workflow(context)
+        if is_factory_active(wf):
+            label = preview_label(wf)
+            cleanup_crm_temp(wf)
+            _delete_persisted_wf(update, wf)
+            wf.clear()
+            _log_user_action(update, "app_cancelled", name=label)
+            await message.reply_text(format_cancelled(label), parse_mode=ParseMode.HTML)
+            if not await _start_next_from_queue(update, context):
+                await message.reply_text("Очередь пуста.")
+            return
+        if share_expects_text(_load_share_job(update, context)):
+            _finish_share_job(update, context)
+            await message.reply_text("Отменил расшарку.")
+            return
+        if queue_size(context.user_data):
+            await _start_next_from_queue(update, context)
+            return
+        await message.reply_text(format_nothing_to_cancel())
+
+    await _run_locked(update, _body)
+
+
+async def clear_queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Очистить очередь заводов, не трогая текущее приложение."""
+    message = update.message
+    if not message:
+        return
+    _ensure_app_queue(update, context)
+    removed = clear_queue(context.user_data)
+    _persist_app_queue(update, context)
+    _log_user_action(update, "app_queue_cleared", removed=removed)
+    await message.reply_text(format_queue_cleared(removed))
 
 
 async def step2_dev(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -918,6 +1112,12 @@ async def _ingest_app_text(
 
     parsed = parse_app_message(text)
     wf = _workflow(context)
+    if is_factory_active(wf):
+        incoming_key = app_key_from_parsed(parsed)
+        current_key = app_key_from_wf(wf)
+        if not incoming_key or incoming_key != current_key:
+            await _enqueue_app_payload(update, context, text)
+            return
     app_key = app_key_from_parsed(parsed)
     if app_key:
         resumable = _find_resumable_state(update, context, app_key)
@@ -2356,6 +2556,16 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         flow = route["flow"]
         if flow == "app":
+            _ensure_app_queue(update, context)
+            if is_factory_active(_workflow(context)):
+                await message.reply_text(
+                    busy_factory_prompt(
+                        preview_label(_workflow(context)),
+                        queue_size(context.user_data),
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+                return
             if share_expects_text(_load_share_job(update, context)):
                 _finish_share_job(update, context)
             wf = _workflow(context)
@@ -2420,6 +2630,8 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command, filters=user_filter))
     app.add_handler(CommandHandler("menu", menu_command, filters=user_filter))
     app.add_handler(CommandHandler("app", app_command, filters=user_filter))
+    app.add_handler(CommandHandler("cancel", cancel_command, filters=user_filter))
+    app.add_handler(CommandHandler("clear_queue", clear_queue_command, filters=user_filter))
     app.add_handler(CommandHandler("domain", domain_command, filters=user_filter))
     app.add_handler(CommandHandler("share_partner", share_partner_command, filters=user_filter))
     app.add_handler(CommandHandler("share_tiktok", share_tiktok_command, filters=user_filter))
