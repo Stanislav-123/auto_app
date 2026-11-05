@@ -193,19 +193,6 @@ def setup_purchased_domain(
             if on_progress:
                 on_progress()
 
-        if "cf_busy" not in done and "zone" in done:
-            _mark_account_busy(
-                state,
-                account,
-                cf,
-                crm,
-                notes,
-                name,
-                emit=emit,
-                on_progress=on_progress,
-                excluded=excluded,
-            )
-
         if "a" not in done:
             created = cf.ensure_apex_a(state["zone_id"], name, ip)
             mark("a", f"{name}: A-запись {'создана' if created else 'уже была'}")
@@ -232,6 +219,19 @@ def setup_purchased_domain(
                 mark("crm_domain", f"{name}: домен добавлен в CRM")
             else:
                 mark("crm_domain", f"{name}: домен уже был в CRM")
+
+        if "cf_busy" not in done and "crm_domain" in done:
+            _mark_account_busy(
+                state,
+                account,
+                cf,
+                crm,
+                notes,
+                name,
+                emit=emit,
+                on_progress=on_progress,
+                excluded=excluded,
+            )
     except AccountUnusable:
         raise
     except Exception as exc:
@@ -270,43 +270,19 @@ def _mark_account_busy(
     try:
         crm.mark_cloudflare_account_busy(crm_id, cloudflare_account_status_payload())
     except Exception as exc:
-        if not _is_missing_fields_error(exc):
-            _give_up_account(
-                state,
-                account,
-                cf,
-                name,
-                exc,
-                emit=emit,
-                on_progress=on_progress,
-                excluded=excluded,
-            )
+        if _is_email_taken_error(exc) or not _is_missing_fields_error(exc):
+            _skip_busy_mark(state, notes, name, exc, emit=emit)
+            return
         ns = list(state.get("ns") or [])
         if len(ns) < 2:
-            _give_up_account(
-                state,
-                account,
-                cf,
-                name,
-                exc,
-                emit=emit,
-                on_progress=on_progress,
-                excluded=excluded,
-            )
+            _skip_busy_mark(state, notes, name, exc, emit=emit)
+            return
         payload = cloudflare_account_update_payload(account, ns[0], ns[1])
         try:
             crm.mark_cloudflare_account_busy(crm_id, payload)
         except Exception as fallback_exc:
-            _give_up_account(
-                state,
-                account,
-                cf,
-                name,
-                fallback_exc,
-                emit=emit,
-                on_progress=on_progress,
-                excluded=excluded,
-            )
+            _skip_busy_mark(state, notes, name, fallback_exc, emit=emit)
+            return
     account["status"] = 1
     stored = state.get("cf_account")
     if isinstance(stored, dict):
@@ -315,10 +291,36 @@ def _mark_account_busy(
     notes.append(f"{name}: аккаунт CF отмечен занятым")
 
 
+def _is_email_taken_error(exc: BaseException) -> bool:
+    """POST /cloudflare-account/update отвечает 409 на свою же почту — unique не исключает текущую запись."""
+    text = str(exc).lower()
+    return "уже занят" in text or "already been taken" in text
+
+
+def _skip_busy_mark(
+    state: dict[str, Any],
+    notes: list[str],
+    name: str,
+    exc: BaseException | None = None,
+    *,
+    emit: Callable[[str], None] | None = None,
+) -> None:
+    """Домен уже в CRM — зону не откатываем, пометку занятым просто фиксируем как неудачную."""
+    done = state.setdefault("done", [])
+    if "cf_busy" not in done:
+        done.append("cf_busy")
+    reason = str(exc) if exc else "почта уже есть в CRM"
+    state["cf_busy_error"] = reason
+    text = f"{name}: домен уже в CRM, но аккаунт CF не пометился занятым ({reason})"
+    notes.append(text)
+    if emit:
+        emit(text)
+
+
 def _is_missing_fields_error(exc: BaseException) -> bool:
     """CRM отвергла короткий payload, потому что ждёт остальные поля."""
     text = str(exc).lower()
-    if "уже занят" in text or "already been taken" in text:
+    if _is_email_taken_error(exc):
         return False
     if "http 422" in text:
         return True
@@ -390,7 +392,7 @@ def _give_up_account(
 
 
 def _failed_step(done: list[str]) -> str:
-    order = ["buy", "zone", "cf_busy", "a", "ssl", "ns", "crm_domain"]
+    order = ["buy", "zone", "a", "ssl", "ns", "crm_domain", "cf_busy"]
     for step in order:
         if step not in done:
             return step
@@ -449,7 +451,11 @@ def run_confirmed_batch(
             emit(text)
 
     free = [item for item in crm.list_free_cloudflare_accounts() if str(item.get("status", 0)) in {"0", "0.0"}]
-    pending = [item for item in domains if "crm_domain" not in item.get("done", [])]
+    pending = [
+        item
+        for item in domains
+        if "crm_domain" not in item.get("done", []) or "cf_busy" not in item.get("done", [])
+    ]
 
     for state in pending:
         name = state["name"]
@@ -469,7 +475,7 @@ def run_confirmed_batch(
                     say(f"{name}: нет в аккаунте Dynadot, пропускаю")
                     state["skipped"] = True
                     state["failed_step"] = None
-                    state["done"] = ["buy", "zone", "cf_busy", "a", "ssl", "ns", "crm_domain"]
+                    state["done"] = ["buy", "zone", "a", "ssl", "ns", "crm_domain", "cf_busy"]
                     if on_progress:
                         on_progress()
                     continue
