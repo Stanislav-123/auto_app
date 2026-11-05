@@ -27,6 +27,7 @@ from src.appsflyer.session import (
     AfError,
     ShareOutcome,
     headless_enabled,
+    login_auth_error_reason,
     login_blocked_reason,
     partner_config_url,
     safe_filename,
@@ -472,8 +473,18 @@ class PlaywrightAppsFlyer:
             if box.count() and not box.first.is_checked():
                 box.first.check()
         self._click_login()
+        # AF shows "Invalid username or password" under the form without leaving /auth/login.
+        try:
+            self.page.wait_for_timeout(800)
+        except Exception:
+            pass
+        auth_err = self._auth_error_reason()
+        if auth_err:
+            self._shot_login_failure()
+            raise AfError(auth_err)
         blocked = self._blocked_reason()
         if blocked:
+            self._shot_login_failure()
             raise AfBlocked(blocked)
         try:
             self.page.wait_for_function(
@@ -487,10 +498,19 @@ class PlaywrightAppsFlyer:
                 timeout=self.timeout,
             )
         except Exception as exc:
+            auth_err = self._auth_error_reason()
+            if auth_err:
+                self._shot_login_failure()
+                raise AfError(auth_err) from exc
             blocked = self._blocked_reason()
             if blocked:
+                self._shot_login_failure()
                 raise AfBlocked(blocked) from exc
-            raise AfError("Не удалось войти в AppsFlyer.") from exc
+            self._shot_login_failure()
+            raise AfError(
+                "Не удалось войти в AppsFlyer. Проверьте AF_EMAIL/AF_PASSWORD или войдите вручную "
+                "(AF_HEADLESS=0) и сохраните сессию."
+            ) from exc
 
     def _click_login(self) -> None:
         assert self.page is not None
@@ -513,18 +533,39 @@ class PlaywrightAppsFlyer:
         raise AfError("Не нашёл кнопку Login.")
 
     def _raise_if_still_login(self) -> None:
+        auth_err = self._auth_error_reason()
+        if auth_err:
+            self._shot_login_failure()
+            raise AfError(auth_err)
         blocked = self._blocked_reason()
         if blocked:
+            self._shot_login_failure()
             raise AfBlocked(blocked)
-        raise AfError("Не удалось войти в AppsFlyer.")
+        self._shot_login_failure()
+        raise AfError(
+            "Не удалось войти в AppsFlyer. Проверьте AF_EMAIL/AF_PASSWORD или войдите вручную "
+            "(AF_HEADLESS=0) и сохраните сессию."
+        )
+
+    def _page_body_text(self) -> str:
+        assert self.page is not None
+        try:
+            return self.page.inner_text("body")
+        except Exception:
+            return ""
+
+    def _auth_error_reason(self) -> str | None:
+        return login_auth_error_reason(self._page_body_text())
+
+    def _shot_login_failure(self) -> None:
+        try:
+            self.capture_failure("login", "login")
+        except Exception:
+            pass
 
     def _blocked_reason(self) -> str | None:
         assert self.page is not None
-        try:
-            text = self.page.inner_text("body")
-        except Exception:
-            text = ""
-        reason = login_blocked_reason(text)
+        reason = login_blocked_reason(self._page_body_text())
         if reason:
             return reason
         frame = self.page.locator(
