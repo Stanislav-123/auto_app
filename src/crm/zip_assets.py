@@ -34,7 +34,6 @@ def classify_image_filename(filename: str) -> str | None:
     Patterns (case-insensitive basename):
     - logo* -> logo
     - zm* -> banner (ZM Apps)
-    - ac* -> banner_appcraft (AppCraft)
     - *compressed_banner* -> slider (screenshots)
     """
     basename = Path(filename).name.lower()
@@ -43,8 +42,6 @@ def classify_image_filename(filename: str) -> str | None:
         return "logo"
     if "compressed_banner" in basename:
         return "slider"
-    if basename.startswith("ac"):
-        return "banner_appcraft"
     if basename.startswith("zm"):
         return "banner"
     return None
@@ -93,13 +90,12 @@ def extract_crm_images_from_zip(
                     dst.write(chunk)
             found[field] = target
 
-    required = ("logo", "banner", "banner_appcraft", "slider")
+    required = ("logo", "banner", "slider")
     missing = [name for name in required if name not in found]
     if missing:
         labels = {
             "logo": "logo.png (логотип)",
             "banner": "ZM_* (баннер ZM Apps)",
-            "banner_appcraft": "AC_* (баннер AppCraft)",
             "slider": "compressed_banner* (скриншоты)",
         }
         missing_labels = ", ".join(labels[name] for name in missing)

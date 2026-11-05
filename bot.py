@@ -1159,7 +1159,6 @@ async def _begin_crm_collection(
         f"Отправьте <b>ZIP-архив</b> с картинками для {platform_hint}:\n"
         "• <code>logo.png</code> — логотип\n"
         "• <code>ZM_*</code> — баннер ZM Apps\n"
-        "• <code>AC_*</code> — баннер AppCraft\n"
         "• <code>compressed_banner*</code> — скриншоты"
         f"{apns_hint}\n\n"
         "Статус: <b>Активен</b>\n"

@@ -203,7 +203,6 @@ def create_crm_app(
                     parsed,
                     logo=files.get("logo"),
                     banner=files.get("banner"),
-                    banner_appcraft=files.get("banner_appcraft"),
                     slider=files.get("slider"),
                     apns_key=files.get("apns"),
                     fcm_key=wf.get("fcm_key"),

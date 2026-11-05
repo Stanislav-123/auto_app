@@ -86,7 +86,7 @@ class _Panel:
 
         return App()
 
-    def configure_app(self, app_id, binom_key):
+    def configure_app(self, app_id, binom_key, campaign_url=None):
         self.configured = (app_id, binom_key)
 
 
@@ -166,7 +166,7 @@ class TestAutoRunner(unittest.TestCase):
             completed_steps=["parse", "binom"],
             crm_ready=True,
             crm_theme_id=1,
-            crm_files={"logo": "a", "banner": "b", "banner_appcraft": "c", "slider": "d"},
+            crm_files={"logo": "a", "banner": "b", "slider": "d"},
         )
         crm = _Crm(fail_grant=True)
         result = execute_next(wf, crm=crm, team_ids=[1], persist=lambda: saved.append(dict(wf["crm"])))
