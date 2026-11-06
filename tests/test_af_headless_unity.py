@@ -66,6 +66,57 @@ class TestStateSaveValidation(unittest.TestCase):
         session._save_state()
         session._context.storage_state.assert_not_called()
     
+    def test_save_state_rejects_suffix_lookalike(self):
+        """Invokes: _save_state() - rejects notappsflyer.com (suffix match bug)."""
+        session = PlaywrightAppsFlyer(email="test@example.com", password="test")
+        session._context = MagicMock()
+        session.page = MagicMock()
+        session.page.url = "https://notappsflyer.com/dashboard"
+        
+        session._login_form_visible = MagicMock(return_value=False)
+        session._blocked_reason = MagicMock(return_value=None)
+        
+        # Should skip - hostname ends with 'appsflyer.com' but is not AF domain
+        session._save_state()
+        session._context.storage_state.assert_not_called()
+    
+    def test_save_state_accepts_valid_af_domains(self):
+        """Invokes: _save_state() - accepts appsflyer.com and *.appsflyer.com."""
+        valid_urls = [
+            "https://appsflyer.com/dashboard",
+            "https://hq1.appsflyer.com/dashboard",
+            "https://www.appsflyer.com/page",
+        ]
+        
+        for url in valid_urls:
+            with self.subTest(url=url):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    state_path = Path(tmpdir) / "af_state.json"
+                    
+                    session = PlaywrightAppsFlyer(email="test@example.com", password="test", state_file=str(state_path))
+                    session._context = MagicMock()
+                    session.page = MagicMock()
+                    session.page.url = url
+                    
+                    session._login_form_visible = MagicMock(return_value=False)
+                    session._blocked_reason = MagicMock(return_value=None)
+                    
+                    # Mock auth UI present
+                    mock_locator = MagicMock()
+                    mock_locator.count.return_value = 1
+                    session.page.locator.return_value = mock_locator
+                    
+                    # Mock storage_state writes valid state
+                    def storage_state_effect(path):
+                        Path(path).write_text(json.dumps({
+                            "cookies": [{"name": "af_session", "domain": ".appsflyer.com"}]
+                        }))
+                    session._context.storage_state.side_effect = storage_state_effect
+                    
+                    # Should save for valid AF domain
+                    session._save_state()
+                    session._context.storage_state.assert_called()
+    
     def test_save_state_proceeds_on_content_pages(self):
         """Invokes: _save_state() - proceeds when on non-login AppsFlyer pages."""
         with tempfile.TemporaryDirectory() as tmpdir:

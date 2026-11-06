@@ -1622,7 +1622,7 @@ class PlaywrightAppsFlyer:
             current_url = self.page.url or ""
             parsed = urlparse(current_url)
             hostname = (parsed.hostname or "").lower()
-            if not hostname.endswith(("appsflyer.com", ".appsflyer.com")):
+            if not (hostname == "appsflyer.com" or hostname.endswith(".appsflyer.com")):
                 logger.info("af_state_skip_save reason=not_appsflyer_host host=%s", hostname)
                 return
             
