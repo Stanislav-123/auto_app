@@ -358,12 +358,14 @@ class PlaywrightAppsFlyer:
     def _configure_network(self, app: str, kind: str, *, tags: list[str] | None = None, game_id: str | None = None) -> ShareOutcome:
         partner_id = PARTNER_IDS[kind]
         self._open_partner(app, partner_id)
+        self._raise_if_terms_required(kind)
         plan = plan_integration(kind, self._read_integration(), tags=tags, game_id=game_id)
         if plan.need_integrate:
             logger.info("af_partner_not_integrated app=%s partner=%s", app, partner_id)
             self._try_integrate(app, partner_id)
             plan = plan_integration(kind, self._read_integration(), tags=tags, game_id=game_id)
         self._raise_if_stuck(plan, partner_id)
+        self._raise_if_terms_required(kind)
         if plan.already:
             return ShareOutcome("already", "уже настроено")
         # Ensure core AF events exist by checking in mapping dropdown and creating if needed
@@ -1102,8 +1104,10 @@ class PlaywrightAppsFlyer:
         
     def _apply_integration(self, plan: IntegrationPlan, *, game_id: str) -> None:
         assert self.page is not None
+        self._raise_if_terms_required()
         if plan.activate or not self._partner_active():
             self._ensure_partner_active()
+            self._raise_if_terms_required()
         for tag in plan.add_tags:
             self._add_tag(tag)
         if plan.set_game_id:
@@ -1112,7 +1116,14 @@ class PlaywrightAppsFlyer:
             self._fill_input("inapp-extra-params", game_id)
         if plan.enable_mapping:
             root = self.page.locator("[data-qa-id=in-app-mapping]")
+            if root.count():
+                root.first.scroll_into_view_if_needed()
             self._click_switch(root.locator("input[data-qa-id=switch-input]").first)
+            add = root.get_by_role("button", name=re.compile(r"add(\s+in-app)?\s+event", re.I))
+            try:
+                add.first.wait_for(state="visible", timeout=self.timeout)
+            except Exception:
+                logger.warning("af_mapping_add_event_not_visible_after_toggle")
         for fix in plan.events:
             if fix.create:
                 self._add_mapping_row(fix.af_event)
@@ -1193,8 +1204,44 @@ class PlaywrightAppsFlyer:
                 return False
         return False
 
+    def _terms_acceptance_required(self) -> str | None:
+        """First-time partner legal gate. Do not click Accept / agree."""
+        assert self.page is not None
+        blob = self._page_body_text().lower()
+        heading = False
+        try:
+            heading = self.page.get_by_role("heading", name=re.compile(r"attribution terms", re.I)).count() > 0
+        except Exception:
+            heading = False
+        if not heading and "attribution terms" not in blob:
+            return None
+        contract = any(
+            token in blob
+            for token in (
+                "legally binding contract",
+                "please read these terms carefully",
+                "if you do not agree to these terms",
+                "do not accept and do not use",
+                "snap terms of service",
+                "by agreeing to these terms",
+            )
+        )
+        if not heading and not contract:
+            return None
+        return (
+            "requires_terms_acceptance: партнёр показывает юридические Attribution Terms. "
+            "Бот не принимает условия. Владелец должен принять их вручную в AppsFlyer, затем повторить расшарку."
+        )
+
+    def _raise_if_terms_required(self, kind: str | None = None) -> None:
+        del kind
+        reason = self._terms_acceptance_required()
+        if reason:
+            raise AfError(reason)
+
     def _ensure_partner_active(self) -> None:
         assert self.page is not None
+        self._raise_if_terms_required()
         extra = self.page.locator("[data-qa-id=extra-params]")
         if self._partner_active() and extra.count():
             return
@@ -1218,6 +1265,7 @@ class PlaywrightAppsFlyer:
 
     def _app_id_wrapper(self):
         assert self.page is not None
+        self._raise_if_terms_required()
         root = self.page.locator("[data-qa-id=extra-params]")
         if not root.count():
             raise AfError("Не нашёл поле App ID")
@@ -1344,29 +1392,51 @@ class PlaywrightAppsFlyer:
         assert self.page is not None
         if self.page.locator(f'[data-qa-id="events-mapping-dropdown-eventName-{af_event}"]').count():
             return
-        
-        add = self.page.locator('[data-qa-id=in-app-mapping]').get_by_role("button", name=re.compile(r"Add event", re.I))
-        if not add.count():
-            add = self.page.get_by_role("button", name=re.compile(r"Add event", re.I))
-        
-        add.first.click()
-        logger.info("af_add_event_row event=%s", af_event)
-        
-        # Wait for new row to appear and stabilize
+
         box = self.page.locator("[data-qa-id=in-app-mapping]")
+        if not box.count():
+            raise AfError(f"Нет блока in-app mapping для {af_event}")
+        box.first.scroll_into_view_if_needed()
+
+        add = box.get_by_role("button", name=re.compile(r"add(\s+in-app)?\s+event", re.I))
+        if not add.count():
+            add = box.locator("button").filter(has_text=re.compile(r"add(\s+in-app)?\s+event", re.I))
+        if not add.count():
+            raise AfError(f"Нет кнопки Add event в блоке in-app mapping для {af_event}")
+
+        prev_buttons = box.locator("button[data-qa-id=select-button]").count()
+        prev_named = self.page.locator('[data-qa-id^="events-mapping-dropdown-eventName-"]').count()
+        add.first.scroll_into_view_if_needed()
+        try:
+            if add.first.is_disabled():
+                raise AfError(f"Кнопка Add event неактивна для {af_event}")
+        except AfError:
+            raise
+        except Exception:
+            pass
+        add.first.click()
+        logger.info("af_add_event_row event=%s prev_buttons=%s", af_event, prev_buttons)
+
         try:
             self.page.wait_for_function(
-                """(prevCount) => {
-                    const buttons = document.querySelectorAll('[data-qa-id=in-app-mapping] button[data-qa-id=select-button]');
-                    return buttons.length > prevCount;
+                """({prevButtons, prevNamed}) => {
+                    const root = document.querySelector('[data-qa-id="in-app-mapping"]');
+                    if (!root) return false;
+                    const buttons = root.querySelectorAll('button[data-qa-id="select-button"]');
+                    const named = [...document.querySelectorAll('[data-qa-id^="events-mapping-dropdown-eventName-"]')];
+                    const emptyName = named.some((node) => {
+                        const qa = node.getAttribute('data-qa-id') || '';
+                        const event = qa.replace('events-mapping-dropdown-eventName-', '');
+                        return !event;
+                    });
+                    return emptyName || buttons.length > prevButtons || named.length > prevNamed;
                 }""",
-                arg=box.locator("button[data-qa-id=select-button]").count(),
-                timeout=3000,
+                arg={"prevButtons": prev_buttons, "prevNamed": prev_named},
+                timeout=self.timeout,
             )
         except Exception as exc:
             raise AfError(f"Новая строка события не появилась для {af_event}") from exc
-        
-        # Find the AF event dropdown in the new row (has eventName in qa-id, no value set)
+
         buttons = box.locator("button[data-qa-id=select-button]")
         target = None
         for index in range(buttons.count()):
@@ -1378,23 +1448,21 @@ class PlaywrightAppsFlyer:
                     parent_qa = parent.first.get_attribute("data-qa-id") or ""
             except Exception:
                 pass
-            
-            # Find button that's part of eventName dropdown and has no value
-            if "eventName" in parent_qa:
-                current = btn.get_attribute("data-value") or ""
-                label = btn.inner_text().strip()
-                if not current and not label:
-                    target = btn
-                    break
-        
+            if "eventName" not in parent_qa:
+                continue
+            current = btn.get_attribute("data-value") or ""
+            label = btn.inner_text().strip()
+            if not current and not label:
+                target = btn
+                break
+
         if target is None:
             raise AfError(f"Не нашёл пустой dropdown AF события для {af_event}")
-        
+
         target.scroll_into_view_if_needed()
         target.click()
         logger.info("af_select_event_dropdown event=%s", af_event)
-        
-        # Wait for dropdown menu to appear
+
         try:
             self.page.wait_for_function(
                 """() => {
@@ -1405,11 +1473,9 @@ class PlaywrightAppsFlyer:
             )
         except Exception:
             pass
-        
-        # Try to select exact match from dropdown or create via free-text
+
         self._select_or_create_event(af_event)
-        
-        # Verify event was selected
+
         try:
             self.page.locator(f'[data-qa-id="events-mapping-dropdown-eventName-{af_event}"]').wait_for(timeout=3000)
         except Exception as exc:

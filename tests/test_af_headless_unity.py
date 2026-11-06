@@ -790,6 +790,86 @@ class TestPlaywrightDOMFixtures(unittest.TestCase):
         self.assertFalse(any("/auth/login" in url for url in session._seen_urls))
         self.assertEqual(self._password_value(), "")
 
+    def test_add_mapping_row_sync_row_after_click(self):
+        """Invokes _add_mapping_row() when the new AF-event row appears immediately on click."""
+        html = """
+        <html><body>
+          <div data-qa-id="in-app-mapping">
+            <button type="button" id="add-event">Add event</button>
+            <div id="rows"></div>
+          </div>
+          <script>
+            document.getElementById('add-event').addEventListener('click', () => {
+              const wrap = document.createElement('div');
+              wrap.setAttribute('data-qa-id', 'events-mapping-dropdown-eventName-');
+              const btn = document.createElement('button');
+              btn.setAttribute('data-qa-id', 'select-button');
+              btn.setAttribute('type', 'button');
+              wrap.appendChild(btn);
+              document.getElementById('rows').appendChild(wrap);
+            });
+            document.addEventListener('click', (event) => {
+              const btn = event.target.closest('button[data-qa-id="select-button"]');
+              if (!btn) return;
+              const wrap = btn.closest('[data-qa-id^="events-mapping-dropdown-eventName-"]');
+              if (!wrap) return;
+              let menu = document.querySelector('[data-qa-id="select-menu__options"]');
+              if (!menu) {
+                menu = document.createElement('div');
+                menu.setAttribute('data-qa-id', 'select-menu__options');
+                menu.setAttribute('role', 'listbox');
+                const opt = document.createElement('div');
+                opt.setAttribute('role', 'option');
+                opt.setAttribute('data-value', 'af_app_opened');
+                opt.setAttribute('data-title', 'af_app_opened');
+                opt.textContent = 'af_app_opened';
+                opt.addEventListener('click', () => {
+                  wrap.setAttribute('data-qa-id', 'events-mapping-dropdown-eventName-af_app_opened');
+                  btn.setAttribute('data-value', 'af_app_opened');
+                  btn.textContent = 'af_app_opened';
+                  menu.remove();
+                });
+                menu.appendChild(opt);
+                document.body.appendChild(menu);
+              }
+            });
+          </script>
+        </body></html>
+        """
+        self.page.set_content(html)
+        session = PlaywrightAppsFlyer(email="user@example.com", password="secret", timeout=4000, headless=True)
+        session.page = self.page
+        session._add_mapping_row("af_app_opened")
+        self.assertEqual(
+            self.page.locator('[data-qa-id="events-mapping-dropdown-eventName-af_app_opened"]').count(),
+            1,
+        )
+
+    def test_snapchat_terms_gate_does_not_accept_or_search_app_id(self):
+        """Invokes configure_snapchat() on Attribution Terms — requires_terms_acceptance, no Accept click."""
+        html = """
+        <html><body>
+          <button data-qa-id="msc-tab-integration">Integration</button>
+          <button data-qa-id="save-tab-changes-btn" disabled>Save Integration</button>
+          <h1>Attribution Terms</h1>
+          <p>Effective: July 1, 2021</p>
+          <p>These Attribution Terms ('Terms') form a legally binding contract between you and Snap Inc.</p>
+          <p>PLEASE READ THESE TERMS CAREFULLY. IF YOU DO NOT AGREE TO THESE TERMS, DO NOT ACCEPT AND DO NOT USE THE ATTRIBUTION PROGRAM.</p>
+          <p>Snap Terms of Service</p>
+          <button type="button" id="accept-terms" onclick="window.__accepted = true">Accept</button>
+        </body></html>
+        """
+        self.page.set_content(html)
+        session = PlaywrightAppsFlyer(email="user@example.com", password="secret", timeout=4000, headless=True)
+        session.page = self.page
+        session._open_partner = lambda *a, **k: None
+        with self.assertRaises(AfError) as caught:
+            session.configure_snapchat("com.napp.game.app", ["11111111-2222-4333-8444-555555555555"])
+        self.assertIn("requires_terms_acceptance", str(caught.exception))
+        self.assertNotIn("App ID", str(caught.exception))
+        accepted = self.page.evaluate("() => window.__accepted === true")
+        self.assertFalse(accepted)
+
 
 if __name__ == "__main__":
     unittest.main()
