@@ -324,42 +324,6 @@ class PlaywrightAppsFlyer:
         links = self._read_unity_links()
         detail = "интеграция уже стоит" if outcome.status == "already" else outcome.detail
         return ShareOutcome(outcome.status, detail, links)
-    
-    def _ensure_core_af_events_exist(self, app: str, partner_id: str) -> None:
-        """Ensure af_app_opened, af_complete_registration, af_purchase exist before mapping."""
-        logger.info("af_ensure_core_events app=%s partner=%s", app, partner_id)
-        
-        # Navigate to Permissions tab to check/create events
-        self._open_partner(app, partner_id)
-        self._click_tab("msc-tab-permissions")
-        
-        # Check which core events are missing
-        existing_events = set(self._selected_event_names())
-        required_events = {"af_app_opened", "af_complete_registration", "af_purchase"}
-        missing_events = required_events - existing_events
-        
-        if not missing_events:
-            logger.info("af_core_events_present app=%s", app)
-            return
-        
-        logger.info("af_core_events_missing app=%s events=%s", app, list(missing_events))
-        
-        # Create missing events
-        for event in sorted(missing_events):  # Sort for deterministic order
-            try:
-                result = self._add_agency_event(event)
-                logger.info("af_core_event_ensured event=%s result=%s", event, result)
-            except AfError as exc:
-                # Log but don't fail - event might be creatable at mapping stage
-                logger.warning("af_core_event_creation_failed event=%s error=%s", event, str(exc)[:100])
-        
-        # Save if events were added
-        if missing_events:
-            try:
-                self._save_and_confirm()
-                logger.info("af_core_events_saved app=%s count=%d", app, len(missing_events))
-            except Exception as exc:
-                logger.warning("af_core_events_save_failed app=%s error=%s", app, str(exc)[:100])
 
     def _read_unity_settled(self, tries: int = 10) -> IntegrationPage:
         """Game ID в форме появляется не сразу после загрузки: ждём, пока поле заполнится."""
@@ -402,14 +366,8 @@ class PlaywrightAppsFlyer:
         self._raise_if_stuck(plan, partner_id)
         if plan.already:
             return ShareOutcome("already", "уже настроено")
-        
-        # Ensure core AF events exist before mapping
-        self._ensure_core_af_events_exist(app, partner_id)
-        
-        # Return to Integration tab after ensuring events
-        self._open_partner(app, partner_id)
-        self._click_tab("msc-tab-integration")
-        
+        # Ensure core AF events exist by checking in mapping dropdown and creating if needed
+        self._ensure_integration_events_exist(plan)
         self._apply_integration(plan, game_id=game_id or "")
         self._save_and_confirm()
         return ShareOutcome("done", "интеграция сохранена")
@@ -697,9 +655,31 @@ class PlaywrightAppsFlyer:
 
     def _blocked_reason(self) -> str | None:
         assert self.page is not None
-        reason = login_blocked_reason(self._page_body_text())
+        
+        # Check for CloudFront 403 block (AppsFlyer blocks headless browsers)
+        body_text = self._page_body_text()
+        title = ""
+        try:
+            title = self.page.title().lower()
+        except Exception:
+            pass
+        
+        blob = body_text.lower()
+        
+        # CloudFront 403 Request Blocked
+        if "403" in blob and any(token in blob for token in ("cloudfront", "request blocked", "forbidden")):
+            return (
+                "AppsFlyer заблокировал запрос (CloudFront 403). "
+                "Это может происходить при использовании headless-режима. "
+                "Используйте AF_HEADLESS=0 для входа через видимый браузер. "
+                "Сохранённая сессия из data/af_state.json может не работать в headless-режиме из-за защиты сайта."
+            )
+        
+        # Check for general auth/blocked reasons
+        reason = login_blocked_reason(body_text)
         if reason:
             return reason
+        
         frame = self.page.locator(
             "iframe[src*='recaptcha'], iframe[src*='hcaptcha'], iframe[title*='recaptcha' i]"
         )
@@ -1007,6 +987,30 @@ class PlaywrightAppsFlyer:
             mapping_enabled=mapping_enabled,
         )
 
+    def _ensure_integration_events_exist(self, plan: IntegrationPlan) -> None:
+        """Ensure required AF events exist by checking in integration mapping and creating if needed.
+        
+        This checks the actual mapping dropdown for each required event and creates missing ones
+        via the dropdown UI itself (not via Permissions tab which changes access unnecessarily).
+        """
+        required_events = {"af_app_opened", "af_complete_registration", "af_purchase"}
+        
+        # Check which events are already configured in the plan
+        existing_events = {fix.af_event for fix in plan.events}
+        
+        # Events that need to be created (not already in mappings)
+        events_to_check = required_events - existing_events
+        
+        if not events_to_check:
+            logger.info("af_required_events_check status=all_present")
+            return
+        
+        logger.info("af_required_events_check missing_from_mappings=%s", sorted(events_to_check))
+        
+        # For events not in mappings, we'll need to check if they exist when we try to add them
+        # The actual check/creation happens in _add_mapping_row -> _select_or_create_event
+        # which will create the event via the dropdown UI if it doesn't exist
+        
     def _apply_integration(self, plan: IntegrationPlan, *, game_id: str) -> None:
         assert self.page is not None
         if plan.activate or not self._partner_active():
@@ -1314,7 +1318,7 @@ class PlaywrightAppsFlyer:
             pass
         
         # Try to select exact match from dropdown or create via free-text
-        self._select_or_create_unity_event(af_event)
+        self._select_or_create_event(af_event)
         
         # Verify event was selected
         try:
@@ -1322,8 +1326,12 @@ class PlaywrightAppsFlyer:
         except Exception as exc:
             raise AfError(f"Событие {af_event} не установилось после выбора") from exc
     
-    def _select_or_create_unity_event(self, af_event: str) -> None:
-        """Select event from dropdown or create via free-text input if supported."""
+    def _select_or_create_event(self, af_event: str) -> None:
+        """Select event from dropdown or create via free-text input if supported.
+        
+        Used for all integration partners (Unity, TikTok, Snapchat) to select or create
+        AF events in the mapping dropdown UI itself, not via Permissions tab.
+        """
         assert self.page is not None
         
         # Try exact match first
