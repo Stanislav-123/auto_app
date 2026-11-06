@@ -96,29 +96,39 @@ def login_mode() -> str:
 def login_auth_error_reason(text: str, email: str | None = None) -> str | None:
     """Неверный логин/пароль или аккаунт заблокирован на форме входа."""
     blob = (text or "").lower()
-    if any(
-        token in blob
-        for token in (
-            "invalid username or password",
-            "incorrect username or password",
-            "incorrect email or password",
-            "wrong email or password",
-            "wrong password",
-            "invalid credentials",
-            "authentication failed",
-            "неверн",
-            "неправильн",
-        )
-    ):
+    
+    # Check for explicit credential error messages near password/login context
+    credential_patterns = (
+        "invalid username or password",
+        "incorrect username or password",
+        "incorrect email or password",
+        "wrong email or password",
+        "wrong password",
+        "invalid credentials",
+        "неверн",
+        "неправильн",
+    )
+    
+    # "authentication failed" can be generic, so check for it separately
+    has_cred_error = any(token in blob for token in credential_patterns)
+    has_auth_failed = "authentication failed" in blob
+    
+    # Only report credential error if we have explicit credential patterns,
+    # OR if we have "authentication failed" AND we're on a login page with form fields
+    has_login_form = any(marker in blob for marker in ("enter password", "email", "log in", "sign in"))
+    
+    if has_cred_error or (has_auth_failed and has_login_form):
         who = mask_email(email)
         suffix = f" для {who}" if who else ""
         return (
-            f"Неверный логин или пароль AppsFlyer{suffix}. "
-            "Бот жмёт обычный Email/Password, не «Log in with Google» и не SSO. "
-            "Если в Chrome вы входите через Google — пароль в .env тут ни при чём: "
-            "либо задайте рабочий пароль именно для AF_EMAIL, либо AF_HEADLESS=0 и "
-            "AF_LOGIN_MODE=manual (войти вручную один раз, сессия уйдёт в data/af_state.json)."
+            f"Ошибка входа в AppsFlyer{suffix}. "
+            "Проверьте AF_EMAIL и AF_PASSWORD. "
+            "Если данные верны, попробуйте AF_LOGIN_MODE=manual с AF_HEADLESS=0: "
+            "войдите вручную один раз через Google/SSO/пароль, сессия сохранится в data/af_state.json и "
+            "будет использоваться для следующих запусков. "
+            "Для автоматического входа бот использует Email/Password, не Google SSO."
         )
+    
     if any(
         token in blob
         for token in (
