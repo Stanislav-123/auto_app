@@ -845,6 +845,58 @@ class TestPlaywrightDOMFixtures(unittest.TestCase):
             1,
         )
 
+    def test_mapping_debug_snapshot_reports_placeholder_select(self):
+        """Invokes _mapping_debug_snapshot() on mapping UI with placeholder Select, no writes."""
+        html = """
+        <html><body>
+          <div data-qa-id="in-app-mapping">
+            <h2>In-app event postbacks</h2>
+            <input data-qa-id="switch-input" type="checkbox" checked />
+            <button type="button">Add event</button>
+            <div data-qa-id="events-mapping-dropdown-eventName-">
+              <button data-qa-id="select-button" type="button">Select...</button>
+            </div>
+          </div>
+        </body></html>
+        """
+        self.page.set_content(html)
+        session = PlaywrightAppsFlyer(email="user@example.com", password="secret", timeout=4000, headless=True)
+        session.page = self.page
+        snap = session._mapping_debug_snapshot()
+        self.assertIn("Select", snap)
+        self.assertIn("eventName", snap)
+        self.assertIn("Add event", snap)
+
+    def test_add_mapping_row_placeholder_label_is_current_miss(self):
+        """Documents current miss: empty eventName row with Select... is not treated as empty."""
+        html = """
+        <html><body>
+          <div data-qa-id="in-app-mapping">
+            <button type="button" id="add-event">Add event</button>
+            <div id="rows"></div>
+          </div>
+          <script>
+            document.getElementById('add-event').addEventListener('click', () => {
+              const wrap = document.createElement('div');
+              wrap.setAttribute('data-qa-id', 'events-mapping-dropdown-eventName-');
+              const btn = document.createElement('button');
+              btn.setAttribute('data-qa-id', 'select-button');
+              btn.setAttribute('type', 'button');
+              btn.textContent = 'Select...';
+              wrap.appendChild(btn);
+              document.getElementById('rows').appendChild(wrap);
+            });
+          </script>
+        </body></html>
+        """
+        self.page.set_content(html)
+        session = PlaywrightAppsFlyer(email="user@example.com", password="secret", timeout=4000, headless=True)
+        session.page = self.page
+        with self.assertRaises(AfError) as caught:
+            session._add_mapping_row("af_app_opened")
+        self.assertIn("пустой dropdown", str(caught.exception))
+        self.assertIn("Select", str(caught.exception))
+
     def test_snapchat_terms_gate_does_not_accept_or_search_app_id(self):
         """Invokes configure_snapchat() on Attribution Terms — requires_terms_acceptance, no Accept click."""
         html = """

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -1435,7 +1436,10 @@ class PlaywrightAppsFlyer:
                 timeout=self.timeout,
             )
         except Exception as exc:
-            raise AfError(f"Новая строка события не появилась для {af_event}") from exc
+            self._focus("[data-qa-id=in-app-mapping]")
+            raise AfError(
+                f"Новая строка события не появилась для {af_event}. {self._mapping_debug_snapshot()}"
+            ) from exc
 
         buttons = box.locator("button[data-qa-id=select-button]")
         target = None
@@ -1457,7 +1461,10 @@ class PlaywrightAppsFlyer:
                 break
 
         if target is None:
-            raise AfError(f"Не нашёл пустой dropdown AF события для {af_event}")
+            self._focus("[data-qa-id=in-app-mapping]")
+            snap = self._mapping_debug_snapshot()
+            logger.warning("af_mapping_empty_dropdown_missing event=%s snap=%s", af_event, snap)
+            raise AfError(f"Не нашёл пустой dropdown AF события для {af_event}. {snap}")
 
         target.scroll_into_view_if_needed()
         target.click()
@@ -1725,6 +1732,44 @@ class PlaywrightAppsFlyer:
                 option.first.click()
                 return True
         return False
+
+    def _mapping_debug_snapshot(self) -> str:
+        """Read-only sanitized mapping-section dump for live failure reports. No clicks."""
+        assert self.page is not None
+        try:
+            data = self.page.evaluate(
+                """() => {
+                    const root = document.querySelector('[data-qa-id="in-app-mapping"]');
+                    if (!root) return {mapping: "missing"};
+                    const toggle = root.querySelector('input[data-qa-id="switch-input"], [role="checkbox"]');
+                    const buttons = [...root.querySelectorAll("button")].slice(0, 16).map((btn) => {
+                        const ancestor = btn.parentElement && btn.parentElement.closest("[data-qa-id]");
+                        return {
+                            text: (btn.innerText || "").trim().slice(0, 48),
+                            qa: btn.getAttribute("data-qa-id") || "",
+                            value: btn.getAttribute("data-value") || "",
+                            disabled: !!btn.disabled,
+                            ancestorQa: ancestor ? (ancestor.getAttribute("data-qa-id") || "") : "",
+                        };
+                    });
+                    const named = [...root.querySelectorAll("[data-qa-id*='eventName'], [data-qa-id^='events-mapping-dropdown-']")]
+                        .slice(0, 16)
+                        .map((node) => node.getAttribute("data-qa-id") || "");
+                    return {
+                        toggleChecked: toggle ? (toggle.checked === true || toggle.getAttribute("aria-checked") === "true") : null,
+                        buttonCount: root.querySelectorAll("button").length,
+                        selectCount: root.querySelectorAll('button[data-qa-id="select-button"]').length,
+                        buttons,
+                        named,
+                        text: (root.innerText || "").replace(/\\s+/g, " ").trim().slice(0, 220),
+                    };
+                }"""
+            )
+            text = json.dumps(data, ensure_ascii=True)[:800]
+            logger.info("af_mapping_debug %s", text)
+            return text
+        except Exception as exc:
+            return f"mapping_snap_failed:{exc}"[:200]
 
     def _click_switch(self, toggle) -> None:
         if not toggle.count() or toggle.is_checked():
