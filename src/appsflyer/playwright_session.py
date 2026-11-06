@@ -519,17 +519,10 @@ class PlaywrightAppsFlyer:
         if not email.count() or not password.count():
             raise AfError("Форма входа AppsFlyer без полей email и password.")
         
-        # Fill fields with human-like delays in headless mode
+        # Fill fields
         email.first.fill("")
-        if self.headless and hasattr(self.page, 'wait_for_timeout'):
-            self.page.wait_for_timeout(100)
         email.first.fill(self.email)
-        
-        if self.headless and hasattr(self.page, 'wait_for_timeout'):
-            self.page.wait_for_timeout(150)
         password.first.fill("")
-        if self.headless and hasattr(self.page, 'wait_for_timeout'):
-            self.page.wait_for_timeout(100)
         password.first.fill(self.password)
         
         filled = ""
@@ -551,32 +544,26 @@ class PlaywrightAppsFlyer:
             if box.count() and not box.first.is_checked():
                 box.first.check()
         
-        if self.headless and hasattr(self.page, 'wait_for_timeout'):
-            self.page.wait_for_timeout(200)
-        
         self._click_login()
         
-        # AF processes login and may show errors without navigation.
-        # Wait longer in headless mode for server response.
-        wait_after_submit = 1500 if self.headless else 800
+        # Wait for either success (navigate away from login) or error (message appears)
+        # Use observable condition instead of arbitrary timeout
         try:
-            if hasattr(self.page, 'wait_for_timeout'):
-                self.page.wait_for_timeout(wait_after_submit)
+            self.page.wait_for_function(
+                """() => {
+                    const path = location.pathname.toLowerCase();
+                    const onLogin = path.includes('/auth/login') || path.endsWith('/login');
+                    const errorMsg = document.querySelector('[class*="error"], [role="alert"]');
+                    const hasError = errorMsg && errorMsg.offsetParent !== null;
+                    return !onLogin || hasError;
+                }""",
+                timeout=10000,
+            )
         except Exception:
             pass
         
-        # Check for errors early but don't fail immediately on generic messages
+        # Check for errors
         auth_err = self._auth_error_reason()
-        if auth_err:
-            # In headless mode, give more time before declaring failure
-            if self.headless and hasattr(self.page, 'wait_for_timeout'):
-                logger.info("af_login_checking_headless_auth_delay")
-                try:
-                    self.page.wait_for_timeout(1000)
-                except Exception:
-                    pass
-                # Re-check after delay
-                auth_err = self._auth_error_reason()
         
         if auth_err:
             self._shot_login_failure()
@@ -855,25 +842,69 @@ class PlaywrightAppsFlyer:
         if not field.count():
             raise AfError(f"Нет поля выбора события для {event}")
         field.first.click()
+        field.first.fill("")
         field.first.press_sequentially(event, delay=20)
+        
+        # Wait for dropdown to render
+        dropdown = self.page.locator('div.af-dropdown-list[role=listbox]')
+        try:
+            dropdown.first.wait_for(state="visible", timeout=2000)
+        except Exception:
+            pass
+        
+        # Try to find exact match option
         option = self.page.locator(
             f'div.af-dropdown-list[role=listbox] [role=option]:has([data-title="{event}"])'
         )
+        
+        found_in_dropdown = False
         try:
-            option.first.wait_for(state="visible", timeout=self.timeout)
+            option.first.wait_for(state="visible", timeout=1000)
+            found_in_dropdown = True
+        except Exception:
+            # Event not in dropdown - will use free-text entry
+            logger.info("af_event_not_in_dropdown event=%s, using_free_text", event)
+        
+        if found_in_dropdown:
+            # Click existing option
+            option.first.click()
+        else:
+            # Use free-text entry to create event
+            for key in TAG_COMMIT_KEYS:
+                field.first.press(key)
+                # Check if event was added
+                try:
+                    self.page.wait_for_function(
+                        """(eventName) => {
+                            const tags = [...document.querySelectorAll('.permissions__inapp-item .af-tag-value')];
+                            return tags.some((tag) => (tag.textContent || '').trim() === eventName);
+                        }""",
+                        arg=event,
+                        timeout=1000,
+                    )
+                    logger.info("af_event_created event=%s key=%s", event, key)
+                    break
+                except Exception:
+                    continue
+            else:
+                # None of the commit keys worked
+                self.page.keyboard.press("Escape")
+                self._focus('[data-qa-id="add-event"]')
+                raise AfError(f"Не удалось добавить событие {event} (ни из списка, ни свободным вводом)")
+        
+        # Verify event was added
+        try:
+            self.page.wait_for_function(
+                """(eventName) => {
+                    const tags = [...document.querySelectorAll('.permissions__inapp-item .af-tag-value')];
+                    return tags.some((tag) => (tag.textContent || '').trim() === eventName);
+                }""",
+                arg=event,
+                timeout=3000,
+            )
         except Exception as exc:
-            self.page.keyboard.press("Escape")
-            self._focus('[data-qa-id="add-event"]')
-            raise AfError(f"Событие {event} не появилось в списке") from exc
-        option.first.click()
-        self.page.wait_for_function(
-            """(eventName) => {
-                const tags = [...document.querySelectorAll('.permissions__inapp-item .af-tag-value')];
-                return tags.some((tag) => (tag.textContent || '').trim() === eventName);
-            }""",
-            arg=event,
-            timeout=self.timeout,
-        )
+            raise AfError(f"Событие {event} не появилось после выбора") from exc
+        
         return "added"
 
     def _focus_row(self, row) -> None:
@@ -1184,45 +1215,44 @@ class PlaywrightAppsFlyer:
         add.first.click()
         logger.info("af_add_event_row event=%s", af_event)
         
-        # Wait for new row to appear
-        try:
-            self.page.wait_for_timeout(400)
-        except Exception:
-            pass
-        
+        # Wait for new row with observable condition
         box = self.page.locator("[data-qa-id=in-app-mapping]")
         buttons = box.locator("button[data-qa-id=select-button]")
-        
-        # Wait for buttons to be ready
         try:
             buttons.last.wait_for(state="visible", timeout=3000)
-        except Exception:
-            pass
+        except Exception as exc:
+            raise AfError(f"Новая строка события не появилась для {af_event}") from exc
         
+        # Find the empty dropdown (no value set yet)
         target = buttons.last
         for index in range(buttons.count()):
             current = buttons.nth(index).get_attribute("data-value") or ""
             label = buttons.nth(index).inner_text().strip()
             if not current and not label:
                 target = buttons.nth(index)
+                break
         
-        # Scroll to and click the target dropdown
-        try:
-            target.scroll_into_view_if_needed()
-        except Exception:
-            pass
-        
+        target.scroll_into_view_if_needed()
         target.click()
         logger.info("af_select_event_dropdown event=%s", af_event)
         
-        # Wait a bit after clicking before trying to select
+        # Try to select from dropdown, or create if not found
         try:
-            self.page.wait_for_timeout(300)
-        except Exception:
-            pass
+            self._pick_open_option(label=af_event)
+        except AfError as exc:
+            # Event not in dropdown - check if we can create it via free-text
+            logger.warning("af_event_not_in_dropdown event=%s error=%s", af_event, str(exc)[:100])
+            # For Unity integration, events should exist. This is an error.
+            raise AfError(
+                f"Событие {af_event} отсутствует в аккаунте AppsFlyer. "
+                f"Добавьте его через AppsFlyer UI сначала, затем повторите интеграцию."
+            ) from exc
         
-        self._pick_open_option(label=af_event)
-        self.page.locator(f'[data-qa-id="events-mapping-dropdown-eventName-{af_event}"]').wait_for()
+        # Verify event was selected
+        try:
+            self.page.locator(f'[data-qa-id="events-mapping-dropdown-eventName-{af_event}"]').wait_for(timeout=3000)
+        except Exception as exc:
+            raise AfError(f"Событие {af_event} не установилось после выбора") from exc
 
     def _read_unity_links(self) -> tuple[str, str]:
         assert self.page is not None
@@ -1279,20 +1309,22 @@ class PlaywrightAppsFlyer:
     def _pick_open_option(self, *, data_value: str | None = None, label: str | None = None) -> None:
         assert self.page is not None
         
-        # Wait for dropdown to render (critical for event selection)
+        # Wait for dropdown to render with observable condition
         try:
             dropdown_visible = self.page.locator(
                 "[data-qa-id=select-menu__options], div.af-dropdown-list[role=listbox]"
             )
             dropdown_visible.first.wait_for(state="visible", timeout=3000)
+            # Wait for at least one option to be present
+            self.page.wait_for_function(
+                """() => {
+                    const opts = document.querySelectorAll('[role=option], [role=menuitem], [data-qa-id=select-option-value]');
+                    return opts.length > 0;
+                }""",
+                timeout=2000,
+            )
         except Exception:
             logger.warning("af_dropdown_wait_timeout label=%s", label or data_value or "unknown")
-        
-        # Give time for dropdown items to populate
-        try:
-            self.page.wait_for_timeout(300)
-        except Exception:
-            pass
         
         if data_value:
             option = self.page.locator(f'[role=option][data-value="{data_value}"], [role=menuitem][data-value="{data_value}"]')
@@ -1301,7 +1333,7 @@ class PlaywrightAppsFlyer:
                 return
         
         if label:
-            # For long lists or when items might not be immediately visible, try search-based menu first
+            # Try search-based menu first (handles long lists)
             if self._pick_menu_option(data_value=data_value, label=label):
                 return
             
@@ -1318,20 +1350,12 @@ class PlaywrightAppsFlyer:
                 option.first.click()
                 return
         
-        # Final fallback: try menu search again with longer wait
-        if self._pick_menu_option(data_value=data_value, label=label, extended_wait=True):
-            return
-        
-        raise AfError(f"Не нашёл пункт {label or data_value}. Проверьте, что событие существует в AppsFlyer.")
+        raise AfError(f"Не нашёл пункт {label or data_value}. Событие может отсутствовать в аккаунте AppsFlyer.")
 
-    def _pick_menu_option(self, *, data_value: str | None = None, label: str | None = None, extended_wait: bool = False) -> bool:
+    def _pick_menu_option(self, *, data_value: str | None = None, label: str | None = None) -> bool:
         """Меню AppsFlyer с поиском: пункты role=button, длинный список виден только после поиска."""
         assert self.page is not None
         menu = self.page.locator("[data-qa-id=select-menu__options]").last
-        if not menu.count():
-            return False
-        
-        # Try dropdown list fallback if select-menu not found
         if not menu.count():
             menu = self.page.locator("div.af-dropdown-list[role=listbox]").last
             if not menu.count():
@@ -1350,10 +1374,20 @@ class PlaywrightAppsFlyer:
         search.first.fill("")
         search.first.fill(label)
         
-        # Wait for search results to filter
-        wait_time = 800 if extended_wait else 500
+        # Wait for search results to filter using observable condition
         try:
-            self.page.wait_for_timeout(wait_time)
+            self.page.wait_for_function(
+                """(searchText) => {
+                    const opts = document.querySelectorAll('[data-qa-id=select-option-value], [role=option]');
+                    const visibleOpts = [...opts].filter(opt => opt.offsetParent !== null);
+                    if (visibleOpts.length === 0) return true; // No results (might create)
+                    return visibleOpts.some(opt => 
+                        (opt.textContent || '').toLowerCase().includes(searchText.toLowerCase())
+                    );
+                }""",
+                arg=label,
+                timeout=2000,
+            )
         except Exception:
             pass
         
@@ -1411,20 +1445,45 @@ class PlaywrightAppsFlyer:
         if self._context is None or self.page is None:
             return
         try:
-            # Don't save state if we're still on login page (failed login)
+            # Validate we're authenticated before saving
             if self._login_form_visible():
                 logger.info("af_state_skip_save reason=login_page_visible")
                 return
             
-            # Don't overwrite existing good state if we're blocked
             blocked = self._blocked_reason()
             if blocked:
                 logger.info("af_state_skip_save reason=blocked")
                 return
             
+            # Verify we're on AppsFlyer domain with valid session
+            current_url = (self.page.url or "").lower()
+            if not any(domain in current_url for domain in ("appsflyer.com", "hq1.appsflyer")):
+                logger.info("af_state_skip_save reason=not_appsflyer_domain url=%s", current_url[:80])
+                return
+            
+            # Atomic save: write to temp file, then move
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            self._context.storage_state(path=str(self.state_file))
-            logger.info("af_state_saved path=%s", self.state_file)
+            temp_file = self.state_file.with_suffix(".tmp")
+            try:
+                self._context.storage_state(path=str(temp_file))
+                # Validate saved state has authentication cookies
+                import json
+                with open(temp_file) as f:
+                    state = json.load(f)
+                has_auth = any(
+                    cookie.get("name", "").startswith(("__Host-", "af_", "session"))
+                    for cookie in state.get("cookies", [])
+                )
+                if not has_auth:
+                    logger.warning("af_state_no_auth_cookies count=%d", len(state.get("cookies", [])))
+                    temp_file.unlink(missing_ok=True)
+                    return
+                # Move temp to final atomically
+                temp_file.replace(self.state_file)
+                logger.info("af_state_saved path=%s cookies=%d", self.state_file, len(state.get("cookies", [])))
+            except Exception as save_exc:
+                temp_file.unlink(missing_ok=True)
+                raise save_exc
         except Exception as exc:
             logger.warning("af_state_save_failed error=%s", exc)
 
