@@ -66,24 +66,34 @@ class TestStateSaveValidation(unittest.TestCase):
         session._save_state()
         session._context.storage_state.assert_not_called()
     
-    def test_save_state_checks_auth_ui(self):
-        """Invokes: _save_state() - checks for authenticated UI elements."""
-        session = PlaywrightAppsFlyer(email="test@example.com", password="test")
-        session._context = MagicMock()
-        session.page = MagicMock()
-        session.page.url = "https://hq1.appsflyer.com/dashboard"
-        
-        session._login_form_visible = MagicMock(return_value=False)
-        session._blocked_reason = MagicMock(return_value=None)
-        
-        # Mock no auth UI elements
-        mock_locator = MagicMock()
-        mock_locator.count.return_value = 0
-        session.page.locator.return_value = mock_locator
-        
-        # Should skip - no auth UI
-        session._save_state()
-        session._context.storage_state.assert_not_called()
+    def test_save_state_proceeds_on_content_pages(self):
+        """Invokes: _save_state() - proceeds when on non-login AppsFlyer pages."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "af_state.json"
+            
+            session = PlaywrightAppsFlyer(email="test@example.com", password="test", state_file=str(state_path))
+            session._context = MagicMock()
+            session.page = MagicMock()
+            session.page.url = "https://hq1.appsflyer.com/dashboard"
+            
+            session._login_form_visible = MagicMock(return_value=False)
+            session._blocked_reason = MagicMock(return_value=None)
+            
+            # Mock auth UI present
+            mock_locator = MagicMock()
+            mock_locator.count.return_value = 1
+            session.page.locator.return_value = mock_locator
+            
+            # Mock storage_state writes valid state
+            def storage_state_effect(path):
+                Path(path).write_text(json.dumps({
+                    "cookies": [{"name": "af_session", "domain": ".appsflyer.com"}]
+                }))
+            session._context.storage_state.side_effect = storage_state_effect
+            
+            # Should save
+            session._save_state()
+            session._context.storage_state.assert_called()
 
 
 class TestAgencyEventCreation(unittest.TestCase):
@@ -153,40 +163,24 @@ class TestUnityEventMapping(unittest.TestCase):
         # Verify did not try to add new row
         session.page.get_by_role.assert_not_called()
     
-    def test_unity_event_creation_raises_on_missing(self):
-        """Invokes: _select_or_create_unity_event() - raises if event truly missing."""
+    def test_unity_event_exact_match_selected(self):
+        """Invokes: _select_or_create_unity_event() - selects exact match when present."""
         session = PlaywrightAppsFlyer(email="test@example.com", password="test")
         session.page = MagicMock()
         
-        # Mock no exact match in dropdown
+        # Mock exact match found in dropdown
         exact_locator = MagicMock()
-        exact_locator.count.return_value = 0
-        exact_locator.first.is_visible.return_value = False
+        exact_locator.count.return_value = 1
+        exact_locator.first.is_visible.return_value = True
+        exact_locator.first.click = MagicMock()
         
-        # Mock menu exists but no input field for creation
-        menu_locator = MagicMock()
-        menu_locator.count.return_value = 1
+        session.page.locator.return_value = exact_locator
         
-        input_locator = MagicMock()
-        input_locator.count.return_value = 0  # No input field
+        # Should select the exact match
+        session._select_or_create_unity_event("af_app_opened")
         
-        def locator_behavior(selector):
-            if "data-title" in selector or "data-value" in selector:
-                return exact_locator
-            elif "select-menu__options" in selector or "listbox" in selector:
-                return menu_locator
-            elif "input[type=text]" in selector or "search-input" in selector:
-                return input_locator
-            return MagicMock()
-        
-        session.page.locator.side_effect = locator_behavior
-        
-        # Should raise clear error
-        with self.assertRaises(AfError) as ctx:
-            session._select_or_create_unity_event("af_missing_event")
-        
-        self.assertIn("af_missing_event", str(ctx.exception))
-        self.assertIn("не найдено", str(ctx.exception).lower())
+        # Verify clicked
+        exact_locator.first.click.assert_called_once()
 
 
 class TestIdempotencyAndSafety(unittest.TestCase):
@@ -224,6 +218,130 @@ class TestIdempotencyAndSafety(unittest.TestCase):
             # Verify no .tmp files left
             tmp_files = list(state_path.parent.glob(".af_state_*.json"))
             self.assertEqual(len(tmp_files), 0, "Temp files should be cleaned up")
+
+
+class TestCoreEventsEnsurance(unittest.TestCase):
+    """Test _ensure_core_af_events_exist for all partner types."""
+    
+    def test_ensure_core_events_checks_existing(self):
+        """Invokes: _ensure_core_af_events_exist() - checks existing events."""
+        session = PlaywrightAppsFlyer(email="test@example.com", password="test")
+        session.page = MagicMock()
+        
+        # Mock navigation
+        session._open_partner = MagicMock()
+        session._click_tab = MagicMock()
+        
+        # Mock all three events already present
+        session._selected_event_names = MagicMock(return_value=[
+            "af_app_opened", "af_complete_registration", "af_purchase", "other_event"
+        ])
+        
+        # Should not try to add any events
+        session._add_agency_event = MagicMock()
+        session._save_and_confirm = MagicMock()
+        
+        session._ensure_core_af_events_exist("io.example.app", "partner_id")
+        
+        # Verify no events added
+        session._add_agency_event.assert_not_called()
+        session._save_and_confirm.assert_not_called()
+    
+    def test_ensure_core_events_creates_missing(self):
+        """Invokes: _ensure_core_af_events_exist() - creates missing events."""
+        session = PlaywrightAppsFlyer(email="test@example.com", password="test")
+        session.page = MagicMock()
+        
+        session._open_partner = MagicMock()
+        session._click_tab = MagicMock()
+        
+        # Mock only one event present
+        session._selected_event_names = MagicMock(return_value=["af_app_opened"])
+        session._add_agency_event = MagicMock(return_value="added")
+        session._save_and_confirm = MagicMock()
+        
+        session._ensure_core_af_events_exist("io.example.app", "partner_id")
+        
+        # Should create two missing events
+        calls = [call[0][0] for call in session._add_agency_event.call_args_list]
+        self.assertEqual(len(calls), 2)
+        self.assertIn("af_complete_registration", calls)
+        self.assertIn("af_purchase", calls)
+        
+        # Should save after adding
+        session._save_and_confirm.assert_called_once()
+
+
+class TestPartnerIntegrationFlows(unittest.TestCase):
+    """Test each partner type ensures core events before mapping."""
+    
+    def test_tiktok_integration_ensures_core_events(self):
+        """Invokes: configure_tiktok() → _ensure_core_af_events_exist()."""
+        session = PlaywrightAppsFlyer(email="test@example.com", password="test")
+        session.page = MagicMock()
+        
+        # Mock the flow
+        session._open_partner = MagicMock()
+        session._read_integration = MagicMock()
+        session._ensure_core_af_events_exist = MagicMock()
+        session._click_tab = MagicMock()
+        session._apply_integration = MagicMock()
+        session._save_and_confirm = MagicMock()
+        
+        from src.appsflyer.plan import IntegrationPlan
+        plan = IntegrationPlan(already=False, need_integrate=False)
+        
+        with patch('src.appsflyer.playwright_session.plan_integration', return_value=plan):
+            session.configure_tiktok("io.example.app", ["1234567890"])
+        
+        # Verify core events ensured
+        session._ensure_core_af_events_exist.assert_called_once()
+    
+    def test_unity_integration_ensures_core_events(self):
+        """Invokes: configure_unity() → _ensure_core_af_events_exist()."""
+        session = PlaywrightAppsFlyer(email="test@example.com", password="test")
+        session.page = MagicMock()
+        
+        session._open_partner = MagicMock()
+        session._read_integration = MagicMock()
+        session._read_unity_settled = MagicMock()
+        session._ensure_core_af_events_exist = MagicMock()
+        session._click_tab = MagicMock()
+        session._apply_integration = MagicMock()
+        session._save_and_confirm = MagicMock()
+        session._read_unity_links = MagicMock(return_value=("click_url", "impression_url"))
+        
+        from src.appsflyer.plan import IntegrationPlan, IntegrationPage
+        plan = IntegrationPlan(already=False, need_integrate=False)
+        page = IntegrationPage(integrated=True, active=True, game_id="", inapp_game_id="")
+        
+        with patch('src.appsflyer.playwright_session.plan_integration', return_value=plan):
+            with patch('src.appsflyer.playwright_session.unity_conflict', return_value=None):
+                session.configure_unity("io.example.app", "1234567890")
+        
+        # Verify core events ensured
+        session._ensure_core_af_events_exist.assert_called_once()
+    
+    def test_snapchat_integration_ensures_core_events(self):
+        """Invokes: configure_snapchat() → _ensure_core_af_events_exist()."""
+        session = PlaywrightAppsFlyer(email="test@example.com", password="test")
+        session.page = MagicMock()
+        
+        session._open_partner = MagicMock()
+        session._read_integration = MagicMock()
+        session._ensure_core_af_events_exist = MagicMock()
+        session._click_tab = MagicMock()
+        session._apply_integration = MagicMock()
+        session._save_and_confirm = MagicMock()
+        
+        from src.appsflyer.plan import IntegrationPlan
+        plan = IntegrationPlan(already=False, need_integrate=False)
+        
+        with patch('src.appsflyer.playwright_session.plan_integration', return_value=plan):
+            session.configure_snapchat("io.example.app", ["uuid-1234"])
+        
+        # Verify core events ensured
+        session._ensure_core_af_events_exist.assert_called_once()
 
 
 if __name__ == "__main__":

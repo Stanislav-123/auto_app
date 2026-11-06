@@ -324,6 +324,42 @@ class PlaywrightAppsFlyer:
         links = self._read_unity_links()
         detail = "интеграция уже стоит" if outcome.status == "already" else outcome.detail
         return ShareOutcome(outcome.status, detail, links)
+    
+    def _ensure_core_af_events_exist(self, app: str, partner_id: str) -> None:
+        """Ensure af_app_opened, af_complete_registration, af_purchase exist before mapping."""
+        logger.info("af_ensure_core_events app=%s partner=%s", app, partner_id)
+        
+        # Navigate to Permissions tab to check/create events
+        self._open_partner(app, partner_id)
+        self._click_tab("msc-tab-permissions")
+        
+        # Check which core events are missing
+        existing_events = set(self._selected_event_names())
+        required_events = {"af_app_opened", "af_complete_registration", "af_purchase"}
+        missing_events = required_events - existing_events
+        
+        if not missing_events:
+            logger.info("af_core_events_present app=%s", app)
+            return
+        
+        logger.info("af_core_events_missing app=%s events=%s", app, list(missing_events))
+        
+        # Create missing events
+        for event in sorted(missing_events):  # Sort for deterministic order
+            try:
+                result = self._add_agency_event(event)
+                logger.info("af_core_event_ensured event=%s result=%s", event, result)
+            except AfError as exc:
+                # Log but don't fail - event might be creatable at mapping stage
+                logger.warning("af_core_event_creation_failed event=%s error=%s", event, str(exc)[:100])
+        
+        # Save if events were added
+        if missing_events:
+            try:
+                self._save_and_confirm()
+                logger.info("af_core_events_saved app=%s count=%d", app, len(missing_events))
+            except Exception as exc:
+                logger.warning("af_core_events_save_failed app=%s error=%s", app, str(exc)[:100])
 
     def _read_unity_settled(self, tries: int = 10) -> IntegrationPage:
         """Game ID в форме появляется не сразу после загрузки: ждём, пока поле заполнится."""
@@ -366,6 +402,14 @@ class PlaywrightAppsFlyer:
         self._raise_if_stuck(plan, partner_id)
         if plan.already:
             return ShareOutcome("already", "уже настроено")
+        
+        # Ensure core AF events exist before mapping
+        self._ensure_core_af_events_exist(app, partner_id)
+        
+        # Return to Integration tab after ensuring events
+        self._open_partner(app, partner_id)
+        self._click_tab("msc-tab-integration")
+        
         self._apply_integration(plan, game_id=game_id or "")
         self._save_and_confirm()
         return ShareOutcome("done", "интеграция сохранена")
