@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 Live AppsFlyer integration test using execute_share API.
 
 Requires parent approval and test IDs before execution.
@@ -44,18 +44,23 @@ def setup_imports(base_path: Path) -> None:
     """Add test directory (current) to sys.path BEFORE base_path.
     
     This ensures test source files are imported instead of production.
+    But allow production dependencies (tags.py, plan.py, agency.py) to load.
     """
     test_dir = Path(__file__).parent.parent.resolve()
     
-    # Remove base_path if already in sys.path (prevent production import)
-    if str(base_path) in sys.path:
-        sys.path.remove(str(base_path))
+    # Clear sys.path of any previous workspace/production entries
+    sys.path = [p for p in sys.path if not (
+        str(base_path) in p or 
+        "/workspace" in p or
+        "\\workspace" in p.replace("\\", "/")
+    )]
     
-    # Add test directory FIRST
+    # Add test directory FIRST (overlay source takes precedence)
     if str(test_dir) not in sys.path:
         sys.path.insert(0, str(test_dir))
     
-    print(f"Using test source from: {test_dir}")
+    print(f"Using overlay source from: {test_dir}")
+    print(f"Loading .env from: {base_path}")
 
 
 def get_test_params() -> dict[str, str]:
@@ -201,11 +206,23 @@ def main() -> int:
     # Load environment first (before imports)
     load_env(base_path)
     
-    # Override state path to use production state
-    state_file = base_path / "data" / "af_state.json"
-    if state_file.exists():
-        os.environ["AF_STATE_PATH"] = str(state_file)
-        print(f"Using state file: {state_file}")
+    # Use private temporary state file (copy from production, save updates to temp only)
+    import tempfile
+    import shutil
+    temp_state_fd, temp_state_path = tempfile.mkstemp(suffix=".json", prefix="af_test_")
+    os.close(temp_state_fd)
+    temp_state_file = Path(temp_state_path)
+    
+    # Copy production state if exists
+    prod_state = base_path / "data" / "af_state.json"
+    if prod_state.exists():
+        shutil.copy(prod_state, temp_state_file)
+        print(f"Copied state from {prod_state}")
+        print(f"Using temp state file: {temp_state_file}")
+        print("(Changes will NOT be saved to production)")
+    
+    # Override state path to use temp
+    os.environ["AF_STATE_PATH"] = str(temp_state_file)
     
     # Force headed mode
     os.environ["AF_HEADLESS"] = "0"
@@ -224,6 +241,14 @@ def main() -> int:
         import traceback
         traceback.print_exc()
         return 1
+    finally:
+        # Cleanup temporary state file
+        try:
+            if temp_state_file.exists():
+                temp_state_file.unlink()
+                print(f"\nCleaned up temp state file")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -42,8 +42,8 @@ def setup_imports(base_path: Path) -> None:
         sys.path.insert(0, str(base_path))
 
 
-def discover_apps(session: Any) -> list[dict[str, str]]:
-    """Discover apps available in AppsFlyer UI (read-only)."""
+def discover_apps(session: Any, max_apps: int = 20) -> list[dict[str, str]]:
+    """Discover apps available in AppsFlyer UI (read-only, bounded)."""
     page = session.page
     if page is None:
         return []
@@ -59,24 +59,69 @@ def discover_apps(session: Any) -> list[dict[str, str]]:
     # Look for app cards/rows in the UI
     apps = []
     try:
-        # Try common selectors for app lists
-        app_elements = page.locator('[data-qa-id*="app"], [class*="app-card"], [class*="app-row"]')
-        count = min(app_elements.count(), 20)  # Bounded to first 20
+        # Try to find app links with bundle/store IDs
+        # AppsFlyer lists apps with their bundle IDs visible
+        links = page.locator('a[href*="/apps/"]')
+        count = min(links.count(), max_apps)
         
         for index in range(count):
-            elem = app_elements.nth(index)
-            # Extract app name and bundle/store id if visible
-            text = elem.inner_text() if elem.count() else ""
-            if text and len(text) < 500:
-                # Simple heuristic: look for bundle-like patterns
-                parts = text.split()
-                for part in parts:
-                    if "." in part and len(part) > 5:
-                        apps.append({"name": text[:100], "bundle": part})
-                        break
+            link = links.nth(index)
+            href = link.get_attribute("href") or ""
+            text = link.inner_text() if link.count() else ""
+            
+            # Extract bundle/store ID from href or text
+            if "/apps/" in href:
+                parts = href.split("/apps/")
+                if len(parts) > 1:
+                    bundle = parts[1].split("/")[0].strip()
+                    if bundle and len(bundle) > 3:
+                        apps.append({
+                            "bundle": bundle,
+                            "name": text[:80].strip() if text else bundle
+                        })
+        
+        # Fallback: parse text content
+        if not apps:
+            app_elements = page.locator('[data-qa-id*="app"], [class*="app-card"], [class*="app-row"], td, li')
+            elem_count = min(app_elements.count(), max_apps * 2)
+            
+            for index in range(elem_count):
+                elem = app_elements.nth(index)
+                text = elem.inner_text() if elem.count() else ""
+                if text and len(text) < 500:
+                    # Look for bundle-like patterns: com.example.app or id12345678
+                    parts = text.split()
+                    for part in parts:
+                        part_clean = part.strip('(),[]{}')
+                        # Bundle ID or store ID pattern
+                        if (("." in part_clean and len(part_clean) > 5) or 
+                            (part_clean.startswith("id") and part_clean[2:].isdigit() and len(part_clean) > 8)):
+                            apps.append({"bundle": part_clean, "name": text[:80].strip()})
+                            break
+                if len(apps) >= max_apps:
+                    break
+        
+        # Remove duplicates
+        seen = set()
+        unique_apps = []
+        for app in apps:
+            if app["bundle"] not in seen:
+                seen.add(app["bundle"])
+                unique_apps.append(app)
+        
+        apps = unique_apps[:max_apps]
         
         if not apps:
             print("WARNING: Could not parse app list from UI")
+            print(f"Page URL: {page.url}")
+            # Take screenshot for debugging
+            screenshot_path = Path("artifacts/discovery_no_apps.png")
+            screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                page.screenshot(path=str(screenshot_path))
+                print(f"Screenshot saved to {screenshot_path}")
+            except Exception:
+                pass
     except Exception as e:
         print(f"WARNING: Error discovering apps: {e}")
     
@@ -133,6 +178,22 @@ def main() -> int:
     load_env(base_path)
     setup_imports(base_path)
     
+    # Use private temporary state file (read-only, don't save to production)
+    import tempfile
+    temp_state_fd, temp_state_path = tempfile.mkstemp(suffix=".json", prefix="af_discover_")
+    os.close(temp_state_fd)
+    temp_state_file = Path(temp_state_path)
+    
+    # Copy production state if exists
+    prod_state = base_path / "data" / "af_state.json"
+    if prod_state.exists():
+        import shutil
+        shutil.copy(prod_state, temp_state_file)
+        print(f"Copied state from {prod_state}")
+    
+    # Override state path to use temp (won't save to production)
+    os.environ["AF_STATE_PATH"] = str(temp_state_file)
+    
     # Import after setting up path
     try:
         from src.appsflyer.playwright_session import PlaywrightAppsFlyer
@@ -158,58 +219,112 @@ def main() -> int:
             
             # Discover or use provided app
             if args.app:
-                candidate = args.app
-                print(f"Inspecting specified app: {candidate}")
+                candidates = [args.app]
+                print(f"Inspecting specified app: {args.app}")
             else:
                 print("Discovering apps...")
-                apps = discover_apps(session)
+                apps = discover_apps(session, max_apps=20)
                 if not apps:
                     result["error"] = "No apps discovered - provide explicit --app argument"
                     print(f"ERROR: {result['error']}")
                     return 1
-                print(f"Found {len(apps)} apps")
-                candidate = apps[0]["bundle"]  # Use first for now
+                print(f"Found {len(apps)} apps: {', '.join(a['bundle'] for a in apps[:5])}{'...' if len(apps) > 5 else ''}")
+                candidates = [a["bundle"] for a in apps]
             
-            result["candidate_app"] = candidate
+            result["apps_checked"] = []
             
-            # Inspect Unity
-            print(f"Inspecting Unity for {candidate}...")
-            unity = inspect_partner(session, candidate, "unityads_int")
-            result["unity_status"] = unity
+            # Check all candidates for first with all 3 unconfigured
+            for idx, candidate in enumerate(candidates):
+                print(f"\n[{idx+1}/{len(candidates)}] Checking {candidate}...")
+                
+                app_result = {
+                    "app": candidate,
+                    "unity": None,
+                    "tiktok": None,
+                    "snapchat": None,
+                    "all_unconfigured": False
+                }
+                
+                try:
+                    # Inspect all three partners
+                    unity = inspect_partner(session, candidate, "unityads_int")
+                    tiktok = inspect_partner(session, candidate, "tiktokglobal_int")
+                    snapchat = inspect_partner(session, candidate, "snapchat_int")
+                    
+                    app_result["unity"] = unity
+                    app_result["tiktok"] = tiktok
+                    app_result["snapchat"] = snapchat
+                    
+                    # Check if all unconfigured
+                    all_unconfigured = (
+                        not unity.get("integrated") and
+                        not tiktok.get("integrated") and
+                        not snapchat.get("integrated")
+                    )
+                    app_result["all_unconfigured"] = all_unconfigured
+                    
+                    result["apps_checked"].append(app_result)
+                    
+                    if all_unconfigured and not result.get("candidate_app"):
+                        result["candidate_app"] = candidate
+                        result["unity_status"] = unity
+                        result["tiktok_status"] = tiktok
+                        result["snapchat_status"] = snapchat
+                        print(f"  ✓ Found eligible app with all 3 unconfigured!")
+                    else:
+                        unity_str = "✗" if unity.get("integrated") else "✓"
+                        tiktok_str = "✗" if tiktok.get("integrated") else "✓"
+                        snap_str = "✗" if snapchat.get("integrated") else "✓"
+                        print(f"  Unity:{unity_str} TikTok:{tiktok_str} Snapchat:{snap_str}")
+                        
+                except Exception as e:
+                    print(f"  ERROR inspecting {candidate}: {str(e)[:100]}")
+                    app_result["error"] = str(e)[:200]
+                    result["apps_checked"].append(app_result)
             
-            # Inspect TikTok
-            print(f"Inspecting TikTok for {candidate}...")
-            tiktok = inspect_partner(session, candidate, "tiktokglobal_int")
-            result["tiktok_status"] = tiktok
-            
-            # Inspect Snapchat
-            print(f"Inspecting Snapchat for {candidate}...")
-            snapchat = inspect_partner(session, candidate, "snapchat_int")
-            result["snapchat_status"] = snapchat
-            
-            # Check if all three are unconfigured or have minimal config
-            all_unconfigured = (
-                not unity.get("integrated") and
-                not tiktok.get("integrated") and
-                not snapchat.get("integrated")
-            )
-            
-            result["success"] = True
-            result["all_unconfigured"] = all_unconfigured
-            
-            print(f"\n{'='*60}")
-            print(f"CANDIDATE APP: {candidate}")
-            print(f"{'='*60}")
-            print(f"Unity: {'Not integrated' if not unity.get('integrated') else f'Integrated (active={unity.get('active')})'}")
-            print(f"TikTok: {'Not integrated' if not tiktok.get('integrated') else f'Integrated (active={tiktok.get('active')})'}")
-            print(f"Snapchat: {'Not integrated' if not snapchat.get('integrated') else f'Integrated (active={snapchat.get('active')})'}")
-            print(f"\nAll unconfigured: {all_unconfigured}")
-            print(f"{'='*60}\n")
+            if result.get("candidate_app"):
+                candidate = result["candidate_app"]
+                
+                result["success"] = True
+                
+                print(f"\n{'='*60}")
+                print(f"BEST CANDIDATE: {candidate}")
+                print(f"{'='*60}")
+                
+                # Format status without nested f-strings
+                unity = result["unity_status"]
+                tiktok = result["tiktok_status"]
+                snapchat = result["snapchat_status"]
+                
+                unity_status = "Not integrated" if not unity.get('integrated') else f"Integrated (active={unity.get('active')})"
+                tiktok_status = "Not integrated" if not tiktok.get('integrated') else f"Integrated (active={tiktok.get('active')})"
+                snapchat_status = "Not integrated" if not snapchat.get('integrated') else f"Integrated (active={snapchat.get('active')})"
+                
+                print(f"Unity: {unity_status}")
+                print(f"TikTok: {tiktok_status}")
+                print(f"Snapchat: {snapchat_status}")
+                print(f"{'='*60}\n")
+            else:
+                result["success"] = True
+                print(f"\n{'='*60}")
+                print(f"NO ELIGIBLE APP FOUND")
+                print(f"{'='*60}")
+                print(f"Checked {len(result['apps_checked'])} apps - none have all 3 unconfigured")
+                print(f"See discovery_result.json for details")
+                print(f"{'='*60}\n")
             
     except Exception as e:
         result["error"] = str(e)[:500]
         print(f"ERROR: {result['error']}")
         return 1
+    finally:
+        # Cleanup temporary state file
+        try:
+            if temp_state_file.exists():
+                temp_state_file.unlink()
+                print(f"Cleaned up temp state file")
+        except Exception:
+            pass
     
     # Write sanitized result
     output_path = Path(args.output)
@@ -218,13 +333,14 @@ def main() -> int:
         json.dump(result, f, indent=2)
     print(f"\nResult written to {output_path}")
     
-    if result.get("all_unconfigured"):
-        print(f"\n✓ Found eligible test app: {candidate}")
+    if result.get("candidate_app"):
+        print(f"\n✓ Found eligible test app: {result['candidate_app']}")
         print("  All three partners (Unity/TikTok/Snapchat) are unconfigured.")
         print("\nParent can now announce this app and provide test IDs for live integration test.")
     else:
-        print(f"\n✗ App {candidate} has existing integrations.")
-        print("  Parent should choose different app or verify current state is acceptable for testing.")
+        print(f"\n✗ No app found with all 3 partners unconfigured.")
+        print(f"  Checked {len(result.get('apps_checked', []))} apps.")
+        print("  Parent should review discovery_result.json and choose app manually.")
     
     return 0
 

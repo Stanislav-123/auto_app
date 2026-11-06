@@ -1,0 +1,195 @@
+================================================================================
+PR #29 - AppsFlyer Integration Event Creation - DEPLOYMENT READY
+================================================================================
+
+FINAL SHA: 0b103d6239dcb7f8c8c946567b408b6c0753f89b
+Branch: cursor/fix-af-headless-unity-events-caaf
+
+================================================================================
+TEST RESULTS - ALL PASS
+================================================================================
+
+Command: PYTHONPATH=/workspace python3 -m unittest tests.test_af_headless_unity tests.test_af_share -v
+
+Results:
+  test_af_headless_unity.py: 34 tests PASS (includes 6 Playwright DOM fixtures)
+  test_af_share.py:           45 tests PASS
+  Total:                      79 tests PASS, 0 FAIL, 0 SKIP (1.467s)
+
+New Tests Added:
+  - test_save_state_rejects_suffix_lookalike (notappsflyer.com bug)
+  - test_save_state_accepts_valid_af_domains (appsflyer.com + subdomains)
+  - 6 Playwright DOM fixture tests (delayed dropdowns, exact match, search, etc.)
+
+================================================================================
+ARTIFACTS FOR PARENT - artifacts/ directory
+================================================================================
+
+1. af_pr29_test.zip (47 KB)
+   - Modified source files only (src/appsflyer/*.py)
+   - Test files (tests/*.py)
+   - Runners (artifacts/*.py)
+   - Instructions (TESTING_INSTRUCTIONS.md)
+   - NO .env, NO state files, NO credentials
+   - For Windows overlay testing WITHOUT overwriting production
+
+2. discover_test_app.py (8.5 KB)
+   - Read-only app discovery runner
+   - Inspects Unity/TikTok/Snapchat status WITHOUT mutations
+   - Uses production .env via --base-path arg
+   - Reports first eligible app (all 3 unconfigured)
+   - Writes sanitized result to discovery_result.json
+   
+   Usage:
+     python artifacts/discover_test_app.py --base-path C:\path\to\production\auto_app
+     python artifacts/discover_test_app.py --base-path C:\path\to\production\auto_app --app io.example.testapp
+
+3. run_live_test.py (7.4 KB)
+   - Live integration test using execute_share API
+   - Requires TEST_APP, TEST_UNITY_GAME_ID, TEST_TIKTOK_APP_ID, TEST_SNAPCHAT_APP_ID
+   - Uses production .env via --base-path arg
+   - Configures all three partners with provided IDs
+   - Reports success/failure with screenshots
+   
+   Usage:
+     set TEST_APP=io.example.testapp
+     set TEST_UNITY_GAME_ID=1234567
+     set TEST_TIKTOK_APP_ID=7234567890123456789
+     set TEST_SNAPCHAT_APP_ID=uuid-1234-5678
+     python artifacts/run_live_test.py --base-path C:\path\to\production\auto_app
+
+4. TESTING_INSTRUCTIONS.md (5.7 KB)
+   - Complete testing workflow
+   - Windows overlay testing setup
+   - Safety features (no production overwrite)
+   - Base-path argument usage (prevents PYTHONPATH mixing)
+   - Common issues and troubleshooting
+
+5. DEPLOYMENT_SUMMARY.txt (this file)
+
+================================================================================
+CODE CHANGES - SELF-REVIEW PASSED
+================================================================================
+
+1. Fresh Row Targeting ✓
+   - Identifies AF event dropdown via parent data-qa-id="eventName"
+   - NOT buttons.last (targets existing rows)
+   - Waits for NEW row with buttons.length > prevCount
+   - Verifies no value set before selecting
+
+2. Exact Search Completion ✓
+   - Exact match via [data-title="{event}"] or [data-value="{event}"]
+   - Regex with anchors: ^\s*{escaped}\s*$
+   - NO loose fallback (won't select af_app_opened_other for af_app_opened)
+
+3. State Save Preservation ✓
+   - Skips on login page visible
+   - Skips on blocked (2FA/CloudFront 403)
+   - Validates hostname: appsflyer.com OR *.appsflyer.com
+   - Rejects notappsflyer.com (suffix lookalike bug FIXED)
+   - Atomic save: unique temp -> replace (concurrent-safe)
+   - Validates AppsFlyer cookies present
+
+4. No Permissions Side Effects ✓
+   - Events created in mapping dropdown (NOT Permissions tab)
+   - NO agency permission mutations on Unity/TikTok/Snapchat
+   - Agency flow unchanged (still uses Permissions as intended)
+   - Comments explicitly state "not via Permissions tab"
+
+5. Hostname Validation Fix ✓
+   - Old: hostname.endswith(("appsflyer.com", ".appsflyer.com"))
+   - New: hostname == "appsflyer.com" or hostname.endswith(".appsflyer.com")
+   - Rejects: notappsflyer.com, evilappsflyer.com
+   - Accepts: appsflyer.com, hq1.appsflyer.com, www.appsflyer.com
+
+================================================================================
+TESTING WORKFLOW FOR PARENT
+================================================================================
+
+STEP 1: Discovery (Read-Only)
+  Extract af_pr29_test.zip to temp directory
+  Run: python artifacts/discover_test_app.py --base-path <production>
+  
+  Output: artifacts/discovery_result.json
+  {
+    "candidate_app": "io.example.testapp",
+    "unity_status": {"integrated": false},
+    "tiktok_status": {"integrated": false},
+    "snapchat_status": {"integrated": false},
+    "all_unconfigured": true
+  }
+  
+  ANNOUNCE candidate app BEFORE proceeding.
+
+STEP 2: Verification (No Writes)
+  Run: python -m unittest tests.test_af_headless_unity tests.test_af_share -v
+  Expect: 79 tests PASS
+
+STEP 3: Live Test (After Approval)
+  Set test IDs (provided by parent)
+  Run: python artifacts/run_live_test.py --base-path <production>
+  
+  Verifies:
+    - Unity: Game ID set, events mapped
+    - TikTok: App ID set, events mapped  
+    - Snapchat: App ID set, events mapped
+    - Core events: af_app_opened, af_complete_registration, af_purchase
+    - All mappings: All media sources + Values & revenue
+
+STEP 4: Manual Verification in AppsFlyer UI
+  Check Unity tab: Game ID, session/level_complete/purchase events
+  Check TikTok tab: App ID, LaunchAPP/Registration/Purchase events
+  Check Snapchat tab: App ID, APP_OPEN/SIGN_UP/PURCHASE events
+  Check all three: All media sources, Values & revenue
+
+================================================================================
+REMAINING REAL-LIVE LIMITATIONS
+================================================================================
+
+UNSOLVED - Headless Mode:
+  - CloudFront 403 observed on test setup with AF_HEADLESS=1
+  - Same credentials work with AF_HEADLESS=0 (headed browser)
+  - Saved session from headed mode fails headless with 403
+  - README updated: "observed on tested setup" (not universal claim)
+  - Workaround: Use AF_HEADLESS=0 for automation
+  - No bypass attempted (respects site security)
+
+REQUIRES PARENT LIVE TEST:
+  1. Unity/TikTok/Snapchat with actual AppsFlyer apps
+  2. Events created when missing via mapping dropdown
+  3. Existing events/mappings preserved (idempotency)
+  4. Unity mappings confirmation (registration vs level_complete)
+  5. No permissions side effects on ad network partners
+
+ARCHITECTURE VALIDATED:
+  ✓ Fresh row identification logic
+  ✓ Exact event matching (no prefix accidents)
+  ✓ State preservation on errors/blocks
+  ✓ Observable wait conditions (no arbitrary timeouts)
+  ✓ Atomic file operations
+  ✓ No Permissions tab mutations for integrations
+  ✓ Hostname validation (rejects lookalikes)
+
+================================================================================
+COMMANDS SUMMARY
+================================================================================
+
+# Run all tests
+PYTHONPATH=/workspace python3 -m unittest tests.test_af_headless_unity tests.test_af_share -v
+
+# Discover test app (read-only)
+python artifacts/discover_test_app.py --base-path /path/to/production
+
+# Inspect specific app (read-only)
+python artifacts/discover_test_app.py --base-path /path/to/production --app io.example.testapp
+
+# Run live test (after parent approval)
+set TEST_APP=io.example.testapp
+set TEST_UNITY_GAME_ID=1234567
+set TEST_TIKTOK_APP_ID=7234567890123456789
+set TEST_SNAPCHAT_APP_ID=uuid-1234-5678
+python artifacts/run_live_test.py --base-path /path/to/production
+
+================================================================================
+NO MERGE - AWAITING PARENT LIVE TEST RESULTS
+================================================================================
