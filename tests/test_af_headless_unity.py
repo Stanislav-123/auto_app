@@ -867,24 +867,62 @@ class TestPlaywrightDOMFixtures(unittest.TestCase):
         self.assertIn("eventName", snap)
         self.assertIn("Add event", snap)
 
-    def test_add_mapping_row_placeholder_label_is_current_miss(self):
-        """Documents current miss: empty eventName row with Select... is not treated as empty."""
+    def test_add_mapping_row_live_select_placeholder_source_only(self):
+        """Invokes _add_mapping_row() on live Unity markup: source Select, partner Select, send defaults."""
         html = """
         <html><body>
           <div data-qa-id="in-app-mapping">
+            <input data-qa-id="switch-input" type="checkbox" checked />
             <button type="button" id="add-event">Add event</button>
-            <div id="rows"></div>
+            <div id="rows">
+              <div data-qa-id="events-mapping-dropdown-eventName-af_purchase">
+                <button data-qa-id="select-button" data-value="af_purchase" type="button">af_purchase</button>
+              </div>
+              <div data-qa-id="events-mapping-dropdown-partnerEventName-af_purchase">
+                <button data-qa-id="select-button" data-value="purchase" type="button">purchase</button>
+              </div>
+            </div>
           </div>
           <script>
-            document.getElementById('add-event').addEventListener('click', () => {
+            function addSelect(parent, qa, value, text) {
               const wrap = document.createElement('div');
-              wrap.setAttribute('data-qa-id', 'events-mapping-dropdown-eventName-');
+              wrap.setAttribute('data-qa-id', qa);
               const btn = document.createElement('button');
               btn.setAttribute('data-qa-id', 'select-button');
               btn.setAttribute('type', 'button');
-              btn.textContent = 'Select...';
+              if (value) btn.setAttribute('data-value', value);
+              btn.textContent = text;
               wrap.appendChild(btn);
-              document.getElementById('rows').appendChild(wrap);
+              parent.appendChild(wrap);
+              return {wrap, btn};
+            }
+            document.getElementById('add-event').addEventListener('click', () => {
+              const rows = document.getElementById('rows');
+              const src = addSelect(rows, 'events-mapping-dropdown-eventName-', '', 'Select');
+              addSelect(rows, 'events-mapping-dropdown-partnerEventName-', '', 'Select');
+              addSelect(rows, 'events-mapping-dropdown-sendingOption-', 'send-attributed', 'This partner only');
+              addSelect(rows, 'events-mapping-dropdown-sendValue-', 'nothing', 'No values & no revenue');
+              src.btn.addEventListener('click', (event) => {
+                event.stopPropagation();
+                let menu = document.querySelector('[data-qa-id="select-menu__options"]');
+                if (menu) menu.remove();
+                menu = document.createElement('div');
+                menu.setAttribute('data-qa-id', 'select-menu__options');
+                menu.setAttribute('role', 'listbox');
+                const opt = document.createElement('div');
+                opt.setAttribute('role', 'option');
+                opt.setAttribute('data-value', 'af_app_opened');
+                opt.setAttribute('data-title', 'af_app_opened');
+                opt.textContent = 'af_app_opened';
+                opt.addEventListener('click', () => {
+                  src.wrap.setAttribute('data-qa-id', 'events-mapping-dropdown-eventName-af_app_opened');
+                  src.btn.setAttribute('data-value', 'af_app_opened');
+                  src.btn.textContent = 'af_app_opened';
+                  menu.remove();
+                });
+                menu.appendChild(opt);
+                document.body.appendChild(menu);
+              });
             });
           </script>
         </body></html>
@@ -892,10 +930,73 @@ class TestPlaywrightDOMFixtures(unittest.TestCase):
         self.page.set_content(html)
         session = PlaywrightAppsFlyer(email="user@example.com", password="secret", timeout=4000, headless=True)
         session.page = self.page
-        with self.assertRaises(AfError) as caught:
-            session._add_mapping_row("af_app_opened")
-        self.assertIn("пустой dropdown", str(caught.exception))
-        self.assertIn("Select", str(caught.exception))
+        session._add_mapping_row("af_app_opened")
+        self.assertEqual(
+            self.page.locator('[data-qa-id="events-mapping-dropdown-eventName-af_app_opened"]').count(),
+            1,
+        )
+        purchase = self.page.locator(
+            '[data-qa-id="events-mapping-dropdown-eventName-af_purchase"] button[data-qa-id=select-button]'
+        )
+        self.assertEqual(purchase.first.get_attribute("data-value"), "af_purchase")
+        self.assertEqual(purchase.first.inner_text().strip(), "af_purchase")
+        partner_blank = self.page.locator(
+            '[data-qa-id="events-mapping-dropdown-partnerEventName-"] button[data-qa-id=select-button]'
+        )
+        self.assertEqual(partner_blank.first.inner_text().strip(), "Select")
+        self.assertEqual(partner_blank.first.get_attribute("data-value") or "", "")
+
+    def test_choose_partner_placeholder_select_sets_label(self):
+        """Invokes _choose() when partnerEventName shows live placeholder Select and empty value."""
+        html = """
+        <html><body>
+          <div data-qa-id="events-mapping-dropdown-partnerEventName-af_app_opened">
+            <button data-qa-id="select-button" type="button">Select</button>
+          </div>
+          <script>
+            document.querySelector('button[data-qa-id=select-button]').addEventListener('click', () => {
+              const menu = document.createElement('div');
+              menu.setAttribute('data-qa-id', 'select-menu__options');
+              menu.setAttribute('role', 'listbox');
+              const opt = document.createElement('div');
+              opt.setAttribute('role', 'option');
+              opt.setAttribute('data-value', 'session');
+              opt.textContent = 'session';
+              opt.addEventListener('click', () => {
+                const btn = document.querySelector('button[data-qa-id=select-button]');
+                btn.setAttribute('data-value', 'session');
+                btn.textContent = 'session';
+                menu.remove();
+              });
+              menu.appendChild(opt);
+              document.body.appendChild(menu);
+            });
+          </script>
+        </body></html>
+        """
+        self.page.set_content(html)
+        session = PlaywrightAppsFlyer(email="user@example.com", password="secret", timeout=4000, headless=True)
+        session.page = self.page
+        session._choose(
+            "events-mapping-dropdown-partnerEventName-af_app_opened",
+            label="session",
+        )
+        btn = self.page.locator(
+            '[data-qa-id="events-mapping-dropdown-partnerEventName-af_app_opened"] button[data-qa-id=select-button]'
+        )
+        self.assertEqual(btn.first.inner_text().strip(), "session")
+        self.assertEqual(btn.first.get_attribute("data-value"), "session")
+
+    def test_unassigned_select_does_not_treat_real_labels_as_empty(self):
+        """Invokes _is_unassigned_select() — only empty value + Select placeholder."""
+        session = PlaywrightAppsFlyer(email="user@example.com", password="secret")
+        self.assertTrue(session._is_unassigned_select("Select", ""))
+        self.assertTrue(session._is_unassigned_select("Select...", ""))
+        self.assertTrue(session._is_unassigned_select("", ""))
+        self.assertFalse(session._is_unassigned_select("af_app_opened", ""))
+        self.assertFalse(session._is_unassigned_select("This partner only", "send-attributed"))
+        self.assertFalse(session._is_unassigned_select("Select", "af_app_opened"))
+        self.assertFalse(session._is_unassigned_select("No values & no revenue", "nothing"))
 
     def test_snapchat_terms_gate_does_not_accept_or_search_app_id(self):
         """Invokes configure_snapchat() on Attribution Terms — requires_terms_acceptance, no Accept click."""

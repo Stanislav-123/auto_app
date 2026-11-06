@@ -1389,6 +1389,27 @@ class PlaywrightAppsFlyer:
             )
         return rows
 
+    def _is_unassigned_select(self, label: str, value: str) -> bool:
+        """Empty data-value plus AF placeholder text (live Unity: innerText 'Select')."""
+        if (value or "").strip():
+            return False
+        folded = re.sub(r"\s+", " ", (label or "").strip().lower()).rstrip(".")
+        return folded in {"", "select", "select event", "select an event"}
+
+    def _unassigned_source_event_button(self, box):
+        """AF source dropdown only: qa events-mapping-dropdown-eventName- with no event id."""
+        nodes = box.locator(
+            '[data-qa-id="events-mapping-dropdown-eventName-"] button[data-qa-id=select-button], '
+            '[data-qa-id="events-mapping-dropdown-eventName"] button[data-qa-id=select-button]'
+        )
+        for index in range(nodes.count()):
+            btn = nodes.nth(index)
+            current = btn.get_attribute("data-value") or ""
+            label = btn.inner_text().strip()
+            if self._is_unassigned_select(label, current):
+                return btn
+        return None
+
     def _add_mapping_row(self, af_event: str) -> None:
         assert self.page is not None
         if self.page.locator(f'[data-qa-id="events-mapping-dropdown-eventName-{af_event}"]').count():
@@ -1441,25 +1462,7 @@ class PlaywrightAppsFlyer:
                 f"Новая строка события не появилась для {af_event}. {self._mapping_debug_snapshot()}"
             ) from exc
 
-        buttons = box.locator("button[data-qa-id=select-button]")
-        target = None
-        for index in range(buttons.count()):
-            btn = buttons.nth(index)
-            parent_qa = ""
-            try:
-                parent = btn.locator("xpath=ancestor::*[@data-qa-id][1]")
-                if parent.count():
-                    parent_qa = parent.first.get_attribute("data-qa-id") or ""
-            except Exception:
-                pass
-            if "eventName" not in parent_qa:
-                continue
-            current = btn.get_attribute("data-value") or ""
-            label = btn.inner_text().strip()
-            if not current and not label:
-                target = btn
-                break
-
+        target = self._unassigned_source_event_button(box)
         if target is None:
             self._focus("[data-qa-id=in-app-mapping]")
             snap = self._mapping_debug_snapshot()
@@ -1605,16 +1608,18 @@ class PlaywrightAppsFlyer:
             raise AfError(f"Не нашёл список {qa_id}")
         current_value = (button.first.get_attribute("data-value") or "").strip()
         current_label = button.first.inner_text().strip()
-        if data_value and (current_value == data_value or sending_is_all(current_value) and data_value == "send-all"):
-            return
-        if data_value == "all" and values_and_revenue(current_value):
-            return
-        if label and label.lower() in current_label.lower():
-            return
-        if data_value == "send-all" and sending_is_all(current_label):
-            return
-        if data_value == "all" and values_and_revenue(current_label):
-            return
+        placeholder = self._is_unassigned_select(current_label, current_value)
+        if not placeholder:
+            if data_value and (current_value == data_value or sending_is_all(current_value) and data_value == "send-all"):
+                return
+            if data_value == "all" and values_and_revenue(current_value):
+                return
+            if label and label.lower() in current_label.lower():
+                return
+            if data_value == "send-all" and sending_is_all(current_label):
+                return
+            if data_value == "all" and values_and_revenue(current_label):
+                return
         button.first.click()
         self._pick_open_option(data_value=data_value, label=label)
 
