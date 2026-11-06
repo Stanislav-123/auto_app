@@ -373,17 +373,106 @@ class PlaywrightAppsFlyer:
         return ShareOutcome("done", "интеграция сохранена")
 
     def ensure_session(self) -> None:
-        """До пачки: если сессии нет, форма логина уже на экране — входим сразу."""
+        """Reuse storage_state if HQ UI is already authenticated; do not open /auth/login first.
+
+        Live evidence: a valid headed session opens /apps/myapps and partner pages, but
+        the same state still shows the login form at LOGIN_URL. Navigating there and
+        submitting the password destroys a working session. Probe an authenticated HQ
+        page instead. 403 / captcha / 2FA fail without a password attempt. Only the
+        login form on the probe page starts the password path.
+        """
         if self.page is None:
             return
         logger.info("af_session_check")
         self._target_url = None
-        self._goto(LOGIN_URL)
-        if self._race_content_or_login() != "login":
+        self._goto("https://hq1.appsflyer.com/apps/myapps")
+        self._classify_session_probe()
+        if self._authenticated_ui():
+            logger.info("af_session_reuse")
             return
+        blocked = self._blocked_reason()
+        if blocked:
+            self._shot_login_failure()
+            raise AfBlocked(blocked)
+        if not self._login_form_visible():
+            self._shot_login_failure()
+            raise AfError(
+                "Не удалось подтвердить сессию AppsFlyer: нет кабинета и нет формы входа. "
+                "Сохранённое состояние не перезаписывается."
+            )
+        logger.info("af_session_needs_login")
+        self._goto(LOGIN_URL)
+        self._classify_session_probe()
+        if self._authenticated_ui():
+            return
+        blocked = self._blocked_reason()
+        if blocked:
+            self._shot_login_failure()
+            raise AfBlocked(blocked)
+        if not self._login_form_visible():
+            self._shot_login_failure()
+            raise AfError(
+                "Не удалось подтвердить сессию AppsFlyer. Сохранённое состояние не перезаписывается."
+            )
         self._login_and_store()
         if self._login_form_visible():
             self._raise_if_still_login()
+
+    def _authenticated_ui(self) -> bool:
+        """Positive HQ evidence: trusted host, not login, not blocked, visible cabinet markers."""
+        assert self.page is not None
+        if self._login_form_visible():
+            return False
+        if self._blocked_reason():
+            return False
+        from urllib.parse import urlparse
+        parsed = urlparse(self.page.url or "")
+        hostname = (parsed.hostname or "").lower()
+        if not (hostname == "appsflyer.com" or hostname.endswith(".appsflyer.com")):
+            return False
+        path = (parsed.path or "").lower()
+        if "/auth/login" in path or path.rstrip("/").endswith("/login"):
+            return False
+        for selector in (
+            "main.msc__content",
+            "main.af-content-wrapper",
+            "[data-qa-id=save-tab-changes-btn]",
+            "button[data-qa-id=msc-tab-integration]",
+            "button[data-qa-id=msc-tab-permissions]",
+        ):
+            node = self.page.locator(selector)
+            try:
+                if node.count() and node.first.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _classify_session_probe(self) -> None:
+        """Wait until HQ content, login form, or a block page is observable."""
+        assert self.page is not None
+        try:
+            self.page.wait_for_function(
+                """() => {
+                    const content = document.querySelector("main.msc__content, main.af-content-wrapper, [data-qa-id=save-tab-changes-btn], button[data-qa-id=msc-tab-integration]");
+                    const login = document.querySelector("input[type=password], input[placeholder*='Enter password' i], input[placeholder*='Enter your email' i], input[type=email]");
+                    const contentVis = !!(content && content.offsetParent !== null);
+                    const loginVis = !!(login && login.offsetParent !== null);
+                    const body = ((document.body && document.body.innerText) || "").toLowerCase();
+                    const blocked = (body.includes("403") && (body.includes("cloudfront") || body.includes("request blocked") || body.includes("forbidden")))
+                        || body.includes("recaptcha") || body.includes("hcaptcha")
+                        || body.includes("i'm not a robot") || body.includes("two-factor")
+                        || body.includes("verification code");
+                    return contentVis || loginVis || blocked;
+                }""",
+                timeout=self.timeout,
+            )
+        except Exception:
+            pass
+        blocked = self._blocked_reason()
+        if blocked:
+            self._shot_login_failure()
+            raise AfBlocked(blocked)
 
     def _open_partner(self, app: str, partner_id: str) -> None:
         url = partner_config_url(app, partner_id)
