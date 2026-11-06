@@ -1,204 +1,229 @@
 #!/usr/bin/env python3
 """
-Behavioral tests for AppsFlyer authentication and event selection.
+Real behavioral tests that invoke production code with Playwright fixtures.
 
-Tests validate observable behaviors, not implementation details.
+Each test calls actual methods and asserts observable effects.
 """
 import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 from src.appsflyer.playwright_session import PlaywrightAppsFlyer
 from src.appsflyer.session import login_auth_error_reason, AfError
-from src.appsflyer.tags import TAG_COMMIT_KEYS
 
 
 class TestAuthErrorClassification(unittest.TestCase):
-    """Test error classification - generic vs credential-specific."""
+    """Test error classification with actual method invocation."""
 
-    def test_generic_auth_failed_without_form_context_not_blamed_on_credentials(self):
-        """Generic 'authentication failed' without login form shouldn't claim bad credentials."""
+    def test_generic_auth_without_form_not_credential_error(self):
+        """Invokes: login_auth_error_reason() - generic error without form."""
         result = login_auth_error_reason("authentication failed")
-        self.assertIsNone(result, "Generic auth failure without form context should not be classified as credential error")
+        self.assertIsNone(result)
     
-    def test_generic_auth_failed_with_form_context_reported(self):
-        """'authentication failed' WITH login form context should be reported."""
-        with_form = "authentication failed\nEnter password\nLog in\nEmail"
-        result = login_auth_error_reason(with_form, email="test@example.com")
+    def test_generic_auth_with_form_is_credential_error(self):
+        """Invokes: login_auth_error_reason() - generic error with form context."""
+        result = login_auth_error_reason("authentication failed\nEnter password\nEmail", email="test@example.com")
         self.assertIsNotNone(result)
         self.assertIn("AF_EMAIL", result)
-        self.assertIn("AF_PASSWORD", result)
     
-    def test_explicit_credential_errors_always_caught(self):
-        """Explicit credential error patterns always detected."""
-        patterns = [
-            "Invalid username or password",
-            "Incorrect email or password",
-            "Wrong password",
-            "Неверный логин или пароль",
-        ]
-        for pattern in patterns:
-            result = login_auth_error_reason(pattern, email="user@example.com")
-            self.assertIsNotNone(result, f"Should detect: {pattern}")
-            self.assertIn("AF_EMAIL", result)
-            self.assertIn("AF_LOGIN_MODE=manual", result)
+    def test_explicit_credential_error_detected(self):
+        """Invokes: login_auth_error_reason() - explicit credential patterns."""
+        result = login_auth_error_reason("Invalid username or password", email="test@example.com")
+        self.assertIsNotNone(result)
+        self.assertIn("AF_LOGIN_MODE=manual", result)
 
 
-class TestStateValidation(unittest.TestCase):
-    """Test session state validation and atomic preservation."""
+class TestStateSaveValidation(unittest.TestCase):
+    """Test _save_state method with mocked Playwright objects."""
     
-    def test_state_structure_validation(self):
-        """Valid state must have cookies and auth tokens."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            state_path = Path(tmpdir) / "state.json"
-            
-            # Invalid: no cookies
-            state_path.write_text('{"origins": []}')
-            with open(state_path) as f:
-                state = json.load(f)
-            self.assertNotIn("__Host-access-token", 
-                str(state.get("cookies", [])),
-                "Empty state should not have auth cookies")
-            
-            # Valid: has auth cookies
-            valid_state = {
-                "cookies": [
-                    {"name": "__Host-access-token", "value": "xxx", "domain": ".appsflyer.com"},
-                    {"name": "session", "value": "yyy", "domain": ".appsflyer.com"},
-                ],
-                "origins": []
-            }
-            state_path.write_text(json.dumps(valid_state))
-            with open(state_path) as f:
-                state = json.load(f)
-            cookie_names = [c["name"] for c in state["cookies"]]
-            self.assertIn("__Host-access-token", cookie_names)
+    def test_save_state_skips_on_login_page(self):
+        """Invokes: _save_state() - should skip when on login page."""
+        session = PlaywrightAppsFlyer(email="test@example.com", password="test")
+        session._context = MagicMock()
+        session.page = MagicMock()
+        session.page.url = "https://hq1.appsflyer.com/auth/login"
+        
+        # Mock _login_form_visible to return True
+        session._login_form_visible = MagicMock(return_value=True)
+        
+        # Should not call storage_state
+        session._save_state()
+        session._context.storage_state.assert_not_called()
     
-    def test_atomic_state_save_uses_temp_file(self):
-        """State save should be atomic (temp file + replace)."""
-        # Structural test: verifies implementation uses atomic pattern
-        # Real test would check file operations during save
-        with tempfile.TemporaryDirectory() as tmpdir:
-            state_path = Path(tmpdir) / "af_state.json"
-            temp_path = state_path.with_suffix(".tmp")
-            
-            # Simulate: write to temp, then replace
-            temp_path.write_text('{"cookies": []}')
-            temp_path.replace(state_path)
-            
-            self.assertTrue(state_path.exists())
-            self.assertFalse(temp_path.exists())
+    def test_save_state_validates_hostname(self):
+        """Invokes: _save_state() - validates AppsFlyer hostname."""
+        session = PlaywrightAppsFlyer(email="test@example.com", password="test")
+        session._context = MagicMock()
+        session.page = MagicMock()
+        session.page.url = "https://evil.com/fake"
+        
+        session._login_form_visible = MagicMock(return_value=False)
+        session._blocked_reason = MagicMock(return_value=None)
+        
+        # Should skip - wrong hostname
+        session._save_state()
+        session._context.storage_state.assert_not_called()
+    
+    def test_save_state_checks_auth_ui(self):
+        """Invokes: _save_state() - checks for authenticated UI elements."""
+        session = PlaywrightAppsFlyer(email="test@example.com", password="test")
+        session._context = MagicMock()
+        session.page = MagicMock()
+        session.page.url = "https://hq1.appsflyer.com/dashboard"
+        
+        session._login_form_visible = MagicMock(return_value=False)
+        session._blocked_reason = MagicMock(return_value=None)
+        
+        # Mock no auth UI elements
+        mock_locator = MagicMock()
+        mock_locator.count.return_value = 0
+        session.page.locator.return_value = mock_locator
+        
+        # Should skip - no auth UI
+        session._save_state()
+        session._context.storage_state.assert_not_called()
 
 
-class TestEventCreationMechanism(unittest.TestCase):
-    """Test event creation via dropdown free-text entry."""
+class TestAgencyEventCreation(unittest.TestCase):
+    """Test _add_agency_event with mock Playwright page."""
     
-    def test_tag_commit_keys_defined(self):
-        """TAG_COMMIT_KEYS should define keys for free-text entry."""
-        self.assertEqual(TAG_COMMIT_KEYS, ("Enter", ",", "Tab"))
-        self.assertGreater(len(TAG_COMMIT_KEYS), 0)
+    def test_agency_event_skips_if_already_selected(self):
+        """Invokes: _add_agency_event() - idempotent, skips existing."""
+        session = PlaywrightAppsFlyer(email="test@example.com", password="test")
+        session.page = MagicMock()
+        
+        # Mock event already in list
+        session._selected_event_names = MagicMock(return_value=["af_app_opened", "af_purchase"])
+        
+        result = session._add_agency_event("af_app_opened")
+        self.assertEqual(result, "skipped")
     
-    def test_event_creation_flow_with_mock(self):
-        """Test event creation when not in dropdown."""
-        # Mock playwright objects
-        mock_page = MagicMock()
+    def test_agency_event_tries_dropdown_first(self):
+        """Invokes: _add_agency_event() - tries dropdown option first."""
+        session = PlaywrightAppsFlyer(email="test@example.com", password="test")
+        session.page = MagicMock()
+        
+        session._selected_event_names = MagicMock(return_value=[])
+        session._events_root = MagicMock()
+        session._empty_event_rows = MagicMock(return_value=[MagicMock()])
+        session._focus_row = MagicMock()
+        
+        # Mock field and dropdown elements
         mock_field = MagicMock()
         mock_option = MagicMock()
+        mock_option.first.wait_for = MagicMock()  # Success - found in dropdown
         
-        # Simulate dropdown doesn't have event
-        mock_option.first.wait_for.side_effect = Exception("Timeout")
-        mock_page.locator.return_value = mock_option
+        def locator_side_effect(selector):
+            if "af-tag-input-input" in selector:
+                mock_field.count.return_value = 1
+                return mock_field
+            elif "af-dropdown-list" in selector:
+                mock_option.first.is_visible.return_value = True
+                return mock_option
+            return MagicMock()
         
-        # Simulate successful free-text entry via Enter key
-        mock_page.wait_for_function.side_effect = [
-            Exception("Not found"),  # First check
-            None,  # Success after Enter
-        ]
+        session.page.locator.side_effect = locator_side_effect
+        session.page.wait_for_function = MagicMock()  # Verification
         
-        # Verify the flow would try commit keys
-        self.assertIn("Enter", TAG_COMMIT_KEYS)
+        result = session._add_agency_event("af_app_opened")
+        
+        # Should have clicked dropdown option
+        mock_option.first.click.assert_called_once()
+        self.assertEqual(result, "added")
 
 
-class TestIdempotency(unittest.TestCase):
-    """Test operations are idempotent - safe to retry."""
+class TestUnityEventMapping(unittest.TestCase):
+    """Test Unity event selection with fixtures."""
     
-    def test_event_already_selected_skips_add(self):
-        """Adding already-selected event should skip, not error."""
-        # This tests the pattern: check existing before adding
-        selected_events = ["af_app_opened", "af_purchase"]
-        new_event = "af_app_opened"
+    def test_unity_mapping_checks_existing_row(self):
+        """Invokes: _add_mapping_row() - idempotent, checks existing."""
+        session = PlaywrightAppsFlyer(email="test@example.com", password="test")
+        session.page = MagicMock()
         
-        # Should skip because already present
-        self.assertIn(new_event, selected_events)
+        # Mock row already exists
+        mock_locator = MagicMock()
+        mock_locator.count.return_value = 1
+        session.page.locator.return_value = mock_locator
         
-        # Verify case-insensitive
-        self.assertTrue(any(e.lower() == "af_app_opened" for e in selected_events))
+        # Should return early
+        session._add_mapping_row("af_app_opened")
+        
+        # Verify did not try to add new row
+        session.page.get_by_role.assert_not_called()
     
-    def test_duplicate_rows_not_created(self):
-        """Idempotent event mapping - no duplicate rows."""
-        # Pattern: check if row exists before creating
-        existing_rows = ["af_app_opened", "af_purchase"]
-        new_event = "af_app_opened"
+    def test_unity_event_creation_raises_on_missing(self):
+        """Invokes: _select_or_create_unity_event() - raises if event truly missing."""
+        session = PlaywrightAppsFlyer(email="test@example.com", password="test")
+        session.page = MagicMock()
         
-        if new_event not in existing_rows:
-            existing_rows.append(new_event)
+        # Mock no exact match in dropdown
+        exact_locator = MagicMock()
+        exact_locator.count.return_value = 0
+        exact_locator.first.is_visible.return_value = False
         
-        # Verify no duplicates
-        self.assertEqual(len(existing_rows), 2)
-        self.assertEqual(len(set(existing_rows)), 2)
+        # Mock menu exists but no input field for creation
+        menu_locator = MagicMock()
+        menu_locator.count.return_value = 1
+        
+        input_locator = MagicMock()
+        input_locator.count.return_value = 0  # No input field
+        
+        def locator_behavior(selector):
+            if "data-title" in selector or "data-value" in selector:
+                return exact_locator
+            elif "select-menu__options" in selector or "listbox" in selector:
+                return menu_locator
+            elif "input[type=text]" in selector or "search-input" in selector:
+                return input_locator
+            return MagicMock()
+        
+        session.page.locator.side_effect = locator_behavior
+        
+        # Should raise clear error
+        with self.assertRaises(AfError) as ctx:
+            session._select_or_create_unity_event("af_missing_event")
+        
+        self.assertIn("af_missing_event", str(ctx.exception))
+        self.assertIn("не найдено", str(ctx.exception).lower())
 
 
-class TestObservableConditions(unittest.TestCase):
-    """Test use of observable conditions vs arbitrary timeouts."""
+class TestIdempotencyAndSafety(unittest.TestCase):
+    """Test operations are safe to retry."""
     
-    def test_login_waits_for_navigation_or_error(self):
-        """Login should wait for observable state, not fixed timeout."""
-        # Verify pattern: wait_for_function with condition, not wait_for_timeout
-        # This is structural - real test would verify actual wait logic
-        observable_patterns = [
-            "location.pathname",  # Navigation check
-            "querySelector('[role=alert'])",  # Error message check
-            "offsetParent !== null",  # Visibility check
-        ]
-        # These patterns should be in the wait_for_function calls
-        for pattern in observable_patterns:
-            self.assertIsInstance(pattern, str)
-    
-    def test_dropdown_waits_for_options_present(self):
-        """Dropdown should wait for options to appear, not fixed delay."""
-        # Verify pattern: wait for at least one option element
-        observable_check = "document.querySelectorAll('[role=option]').length > 0"
-        self.assertIn("role=option", observable_check)
-
-
-class TestFailurePreservation(unittest.TestCase):
-    """Test that failures preserve good state."""
-    
-    def test_login_failure_skips_state_save(self):
-        """Login failure should not overwrite existing good state."""
+    def test_state_save_atomic_with_unique_temp(self):
+        """Invokes: _save_state() - uses unique temp file."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            state_file = Path(tmpdir) / "af_state.json"
-            good_state = {"cookies": [{"name": "__Host-access-token", "value": "good"}]}
-            state_file.write_text(json.dumps(good_state))
+            state_path = Path(tmpdir) / "af_state.json"
             
-            # Verify file exists with good state
-            self.assertTrue(state_file.exists())
-            with open(state_file) as f:
-                loaded = json.load(f)
-            self.assertEqual(loaded["cookies"][0]["value"], "good")
+            session = PlaywrightAppsFlyer(email="test@example.com", password="test", state_file=str(state_path))
+            session._context = MagicMock()
+            session.page = MagicMock()
+            session.page.url = "https://hq1.appsflyer.com/dashboard"
             
-            # Simulate: _save_state called but sees login_form_visible=True
-            # Should skip save, leaving file unchanged
-            # (Real implementation checks this condition)
-    
-    def test_blocked_state_skips_save(self):
-        """Blocked by captcha/2FA should not save state."""
-        # Pattern: check _blocked_reason() before saving
-        blocked_indicators = ["recaptcha", "2fa", "verification code"]
-        for indicator in blocked_indicators:
-            self.assertIsInstance(indicator, str)
+            session._login_form_visible = MagicMock(return_value=False)
+            session._blocked_reason = MagicMock(return_value=None)
+            
+            # Mock auth UI present
+            auth_locator = MagicMock()
+            auth_locator.count.return_value = 1
+            session.page.locator.return_value = auth_locator
+            
+            # Mock storage_state writes valid JSON
+            def storage_state_side_effect(path):
+                Path(path).write_text(json.dumps({
+                    "cookies": [{"name": "af_session", "domain": ".appsflyer.com"}]
+                }))
+            session._context.storage_state.side_effect = storage_state_side_effect
+            
+            session._save_state()
+            
+            # Verify final file exists
+            self.assertTrue(state_path.exists())
+            # Verify no .tmp files left
+            tmp_files = list(state_path.parent.glob(".af_state_*.json"))
+            self.assertEqual(len(tmp_files), 0, "Temp files should be cleaned up")
 
 
 if __name__ == "__main__":

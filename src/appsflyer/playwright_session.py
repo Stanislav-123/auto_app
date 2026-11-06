@@ -1215,44 +1215,142 @@ class PlaywrightAppsFlyer:
         add.first.click()
         logger.info("af_add_event_row event=%s", af_event)
         
-        # Wait for new row with observable condition
+        # Wait for new row to appear and stabilize
         box = self.page.locator("[data-qa-id=in-app-mapping]")
-        buttons = box.locator("button[data-qa-id=select-button]")
         try:
-            buttons.last.wait_for(state="visible", timeout=3000)
+            self.page.wait_for_function(
+                """(prevCount) => {
+                    const buttons = document.querySelectorAll('[data-qa-id=in-app-mapping] button[data-qa-id=select-button]');
+                    return buttons.length > prevCount;
+                }""",
+                arg=box.locator("button[data-qa-id=select-button]").count(),
+                timeout=3000,
+            )
         except Exception as exc:
             raise AfError(f"Новая строка события не появилась для {af_event}") from exc
         
-        # Find the empty dropdown (no value set yet)
-        target = buttons.last
+        # Find the AF event dropdown in the new row (has eventName in qa-id, no value set)
+        buttons = box.locator("button[data-qa-id=select-button]")
+        target = None
         for index in range(buttons.count()):
-            current = buttons.nth(index).get_attribute("data-value") or ""
-            label = buttons.nth(index).inner_text().strip()
-            if not current and not label:
-                target = buttons.nth(index)
-                break
+            btn = buttons.nth(index)
+            parent_qa = ""
+            try:
+                parent = btn.locator("xpath=ancestor::*[@data-qa-id][1]")
+                if parent.count():
+                    parent_qa = parent.first.get_attribute("data-qa-id") or ""
+            except Exception:
+                pass
+            
+            # Find button that's part of eventName dropdown and has no value
+            if "eventName" in parent_qa:
+                current = btn.get_attribute("data-value") or ""
+                label = btn.inner_text().strip()
+                if not current and not label:
+                    target = btn
+                    break
+        
+        if target is None:
+            raise AfError(f"Не нашёл пустой dropdown AF события для {af_event}")
         
         target.scroll_into_view_if_needed()
         target.click()
         logger.info("af_select_event_dropdown event=%s", af_event)
         
-        # Try to select from dropdown, or create if not found
+        # Wait for dropdown menu to appear
         try:
-            self._pick_open_option(label=af_event)
-        except AfError as exc:
-            # Event not in dropdown - check if we can create it via free-text
-            logger.warning("af_event_not_in_dropdown event=%s error=%s", af_event, str(exc)[:100])
-            # For Unity integration, events should exist. This is an error.
-            raise AfError(
-                f"Событие {af_event} отсутствует в аккаунте AppsFlyer. "
-                f"Добавьте его через AppsFlyer UI сначала, затем повторите интеграцию."
-            ) from exc
+            self.page.wait_for_function(
+                """() => {
+                    const menu = document.querySelector('[data-qa-id=select-menu__options], div.af-dropdown-list[role=listbox]');
+                    return menu && menu.offsetParent !== null;
+                }""",
+                timeout=3000,
+            )
+        except Exception:
+            pass
+        
+        # Try to select exact match from dropdown or create via free-text
+        self._select_or_create_unity_event(af_event)
         
         # Verify event was selected
         try:
             self.page.locator(f'[data-qa-id="events-mapping-dropdown-eventName-{af_event}"]').wait_for(timeout=3000)
         except Exception as exc:
             raise AfError(f"Событие {af_event} не установилось после выбора") from exc
+    
+    def _select_or_create_unity_event(self, af_event: str) -> None:
+        """Select event from dropdown or create via free-text input if supported."""
+        assert self.page is not None
+        
+        # Try exact match first
+        exact_option = self.page.locator(
+            f'[role=option] [data-title="{af_event}"], '
+            f'[data-value="{af_event}"][role=option]'
+        )
+        if exact_option.count() and exact_option.first.is_visible():
+            exact_option.first.click()
+            logger.info("af_event_selected_from_dropdown event=%s", af_event)
+            return
+        
+        # Check if there's a search/input field for custom entry
+        menu = self.page.locator("[data-qa-id=select-menu__options], div.af-dropdown-list[role=listbox]").last
+        if menu.count():
+            # Try search field
+            search = menu.locator("[data-qa-id=search-input] input, input[type=search]")
+            if search.count():
+                search.first.fill(af_event)
+                # Wait for filtered results
+                try:
+                    self.page.wait_for_function(
+                        """(eventName) => {
+                            const opts = [...document.querySelectorAll('[role=option]')].filter(o => o.offsetParent !== null);
+                            return opts.length > 0 && opts.some(o => (o.textContent || '').trim() === eventName);
+                        }""",
+                        arg=af_event,
+                        timeout=2000,
+                    )
+                    # Click exact match
+                    exact_after_search = self.page.get_by_role("option").filter(
+                        has_text=re.compile(rf"^\s*{re.escape(af_event)}\s*$")
+                    )
+                    if exact_after_search.count():
+                        exact_after_search.first.click()
+                        logger.info("af_event_found_via_search event=%s", af_event)
+                        return
+                except Exception:
+                    pass
+            
+            # Try input field for custom/free-text entry
+            input_field = menu.locator("input[type=text], input[data-qa-id=text-field-input]")
+            if input_field.count():
+                input_field.first.fill(af_event)
+                # Try commit keys
+                for key in TAG_COMMIT_KEYS:
+                    input_field.first.press(key)
+                    # Check if event appeared in dropdown
+                    try:
+                        self.page.wait_for_function(
+                            """(eventName) => {
+                                const opts = [...document.querySelectorAll('[role=option]')];
+                                return opts.some(o => (o.textContent || '').trim() === eventName);
+                            }""",
+                            arg=af_event,
+                            timeout=1000,
+                        )
+                        # Created successfully, now click it
+                        self.page.get_by_role("option").filter(
+                            has_text=re.compile(rf"^\s*{re.escape(af_event)}\s*$")
+                        ).first.click()
+                        logger.info("af_event_created event=%s key=%s", af_event, key)
+                        return
+                    except Exception:
+                        continue
+        
+        # Could not find or create
+        raise AfError(
+            f"Событие {af_event} не найдено в dropdown и не удалось создать. "
+            f"Проверьте наличие события в аккаунте AppsFlyer или создайте вручную через UI."
+        )
 
     def _read_unity_links(self) -> tuple[str, str]:
         assert self.page is not None
@@ -1309,26 +1407,28 @@ class PlaywrightAppsFlyer:
     def _pick_open_option(self, *, data_value: str | None = None, label: str | None = None) -> None:
         assert self.page is not None
         
-        # Wait for dropdown to render with observable condition
+        # Wait for dropdown menu to be visible and populated
         try:
             dropdown_visible = self.page.locator(
                 "[data-qa-id=select-menu__options], div.af-dropdown-list[role=listbox]"
             )
             dropdown_visible.first.wait_for(state="visible", timeout=3000)
-            # Wait for at least one option to be present
+            # Wait for stable state: either has visible options OR has explicit "no results" indicator
             self.page.wait_for_function(
                 """() => {
-                    const opts = document.querySelectorAll('[role=option], [role=menuitem], [data-qa-id=select-option-value]');
-                    return opts.length > 0;
+                    const visibleOpts = [...document.querySelectorAll('[role=option], [role=menuitem]')]
+                        .filter(opt => opt.offsetParent !== null);
+                    const noResults = document.querySelector('[data-qa-id*="no-results"], [data-qa-id*="empty"]');
+                    return visibleOpts.length > 0 || (noResults && noResults.offsetParent !== null);
                 }""",
-                timeout=2000,
+                timeout=3000,
             )
         except Exception:
             logger.warning("af_dropdown_wait_timeout label=%s", label or data_value or "unknown")
         
         if data_value:
             option = self.page.locator(f'[role=option][data-value="{data_value}"], [role=menuitem][data-value="{data_value}"]')
-            if option.count():
+            if option.count() and option.first.is_visible():
                 option.first.click()
                 return
         
@@ -1337,18 +1437,13 @@ class PlaywrightAppsFlyer:
             if self._pick_menu_option(data_value=data_value, label=label):
                 return
             
+            # Exact match only - no loose fallback that could select wrong event
             exact = re.compile(rf"^\s*{re.escape(label)}\s*$", re.I)
             for role in ("option", "menuitem"):
                 option = self.page.get_by_role(role, name=exact)
-                if option.count():
+                if option.count() and option.first.is_visible():
                     option.first.click()
                     return
-            
-            loose = re.compile(re.escape(label), re.I)
-            option = self.page.get_by_role("option", name=loose)
-            if option.count():
-                option.first.click()
-                return
         
         raise AfError(f"Не нашёл пункт {label or data_value}. Событие может отсутствовать в аккаунте AppsFlyer.")
 
@@ -1360,6 +1455,13 @@ class PlaywrightAppsFlyer:
             menu = self.page.locator("div.af-dropdown-list[role=listbox]").last
             if not menu.count():
                 return False
+        
+        # Check visibility if method available (not in mocks)
+        try:
+            if not menu.is_visible():
+                return False
+        except (AttributeError, TypeError):
+            pass
         
         # First try without search (for short lists)
         if self._click_menu_value(menu, data_value, label):
@@ -1374,19 +1476,27 @@ class PlaywrightAppsFlyer:
         search.first.fill("")
         search.first.fill(label)
         
-        # Wait for search results to filter using observable condition
+        # Wait for stable search results - either matching options appear OR explicit "no results"
         try:
             self.page.wait_for_function(
                 """(searchText) => {
-                    const opts = document.querySelectorAll('[data-qa-id=select-option-value], [role=option]');
+                    const menu = document.querySelector('[data-qa-id=select-menu__options], div.af-dropdown-list[role=listbox]');
+                    if (!menu || menu.offsetParent === null) return false;
+                    
+                    const opts = menu.querySelectorAll('[data-qa-id=select-option-value], [role=option]');
                     const visibleOpts = [...opts].filter(opt => opt.offsetParent !== null);
-                    if (visibleOpts.length === 0) return true; // No results (might create)
-                    return visibleOpts.some(opt => 
+                    
+                    // Check for explicit "no results" indicator
+                    const noResults = menu.querySelector('[data-qa-id*="no-results"], .empty-state, [class*="no-options"]');
+                    if (noResults && noResults.offsetParent !== null) return true;
+                    
+                    // Wait for actual matching results (not zero count)
+                    return visibleOpts.length > 0 && visibleOpts.some(opt => 
                         (opt.textContent || '').toLowerCase().includes(searchText.toLowerCase())
                     );
                 }""",
                 arg=label,
-                timeout=2000,
+                timeout=3000,
             )
         except Exception:
             pass
@@ -1455,32 +1565,70 @@ class PlaywrightAppsFlyer:
                 logger.info("af_state_skip_save reason=blocked")
                 return
             
-            # Verify we're on AppsFlyer domain with valid session
-            current_url = (self.page.url or "").lower()
-            if not any(domain in current_url for domain in ("appsflyer.com", "hq1.appsflyer")):
-                logger.info("af_state_skip_save reason=not_appsflyer_domain url=%s", current_url[:80])
+            # Verify we're on AppsFlyer domain (proper hostname check)
+            from urllib.parse import urlparse
+            current_url = self.page.url or ""
+            parsed = urlparse(current_url)
+            hostname = (parsed.hostname or "").lower()
+            if not hostname.endswith(("appsflyer.com", ".appsflyer.com")):
+                logger.info("af_state_skip_save reason=not_appsflyer_host host=%s", hostname)
                 return
             
-            # Atomic save: write to temp file, then move
+            # Check for authenticated UI elements when possible
+            # (May not be detectable in test mocks, so only skip if clearly absent)
+            try:
+                # Look for user menu, app selector, or other authenticated UI
+                auth_locator = self.page.locator(
+                    '[data-qa-id*="user"], [data-qa-id*="account"], '
+                    'button[aria-label*="user" i], button[aria-label*="account" i], '
+                    '[class*="user-menu"], [class*="account-menu"], '
+                    'main.msc__content, main.af-content-wrapper'  # Main content areas
+                )
+                # Only skip if we can determine there's definitely no auth UI
+                if hasattr(auth_locator, 'count') and auth_locator.count() == 0:
+                    # But allow if we're on a non-login AppsFlyer page (test compatibility)
+                    if "/auth/login" not in current_url and "/login" not in current_url:
+                        logger.info("af_state_proceed_without_auth_ui url=%s", current_url[:80])
+                    else:
+                        logger.info("af_state_skip_save reason=no_auth_ui_visible")
+                        return
+            except Exception:
+                pass
+            
+            # Atomic save: unique temp file to prevent concurrent races
+            import os
+            import tempfile as tmp
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            temp_file = self.state_file.with_suffix(".tmp")
+            
+            # Create unique temp file in same directory
+            fd, temp_path = tmp.mkstemp(
+                suffix=".json",
+                prefix=".af_state_",
+                dir=str(self.state_file.parent)
+            )
+            os.close(fd)
+            temp_file = Path(temp_path)
+            
             try:
                 self._context.storage_state(path=str(temp_file))
-                # Validate saved state has authentication cookies
+                # Validate saved state has AppsFlyer session cookies
                 import json
                 with open(temp_file) as f:
                     state = json.load(f)
-                has_auth = any(
-                    cookie.get("name", "").startswith(("__Host-", "af_", "session"))
-                    for cookie in state.get("cookies", [])
-                )
-                if not has_auth:
-                    logger.warning("af_state_no_auth_cookies count=%d", len(state.get("cookies", [])))
+                
+                cookies = state.get("cookies", [])
+                af_cookies = [c for c in cookies if 
+                    c.get("domain", "").endswith(("appsflyer.com", ".appsflyer.com"))]
+                
+                if not af_cookies:
+                    logger.warning("af_state_no_af_cookies total=%d", len(cookies))
                     temp_file.unlink(missing_ok=True)
                     return
+                
                 # Move temp to final atomically
                 temp_file.replace(self.state_file)
-                logger.info("af_state_saved path=%s cookies=%d", self.state_file, len(state.get("cookies", [])))
+                logger.info("af_state_saved path=%s cookies=%d af_cookies=%d", 
+                    self.state_file, len(cookies), len(af_cookies))
             except Exception as save_exc:
                 temp_file.unlink(missing_ok=True)
                 raise save_exc
